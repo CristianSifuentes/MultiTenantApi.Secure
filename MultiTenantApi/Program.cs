@@ -1,21 +1,24 @@
-using System.IdentityModel.Tokens.Jwt;
-using System.Security.Claims;
-using System.Threading.RateLimiting;
+using Mapster;
+using MapsterMapper;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Logging;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
-using Mapster;
-using MapsterMapper;
-using Serilog;
 using MultiTenantApi.Common;
+using MultiTenantApi.Infrastructure; // JsonWebToken (faster parser)
 using MultiTenantApi.Mapping;
 using MultiTenantApi.Middleware;
 using MultiTenantApi.Models;
 using MultiTenantApi.Security;
 using MultiTenantApi.Services;
+using Serilog;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -47,47 +50,127 @@ var audience = azureAd["Audience"]
 builder.Services.Configure<SyntheticIdOptions>(builder.Configuration.GetSection("SyntheticId"));
 builder.Services.Configure<RateLimitOptions>(builder.Configuration.GetSection("RateLimiting"));
 
+
+builder.Services.AddDistributedMemoryCache(); // dev
+
+
+builder.Services.Configure<TokenHardeningOptions>(
+    builder.Configuration.GetSection("TokenHardening"));
+
 // =====================================================
 // AuthN (JWT Bearer) — hardened issuer + audience checks
 // =====================================================
-builder.Services
-    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+.AddJwtBearer(options =>
+{
+    options.Authority = authority;
+    options.RequireHttpsMetadata = true;
+
+    var hardening = builder.Configuration.GetSection("TokenHardening").Get<TokenHardeningOptions>() ?? new();
+
+    options.TokenValidationParameters = new TokenValidationParameters
     {
-        options.Authority = authority;
+        // ✅ Strong signature required
+        RequireSignedTokens = true,
+        ValidateIssuerSigningKey = true,
+        RequireExpirationTime = true,
 
-        // IMPORTANT: We validate audience explicitly to prevent tokens meant for other APIs being accepted.
-        options.TokenValidationParameters = new TokenValidationParameters
+        // ✅ Strict iss / aud (you already do this)
+        ValidateIssuer = true,
+        IssuerValidator = TenantAllowListIssuerValidator.Build(builder.Configuration),
+
+        ValidateAudience = true,
+        ValidAudiences = new[]
         {
-            ValidateAudience = true,
-            ValidAudiences = new[]
-            {
-                audience,              // api://{clientId}
-                azureAd["ClientId"]    // {clientId} (GUID) — helps tooling like Postman
-            }.Where(x => !string.IsNullOrWhiteSpace(x)).ToArray(),
+            audience,
+            azureAd["ClientId"]
+        }.Where(x => !string.IsNullOrWhiteSpace(x)).ToArray(),
 
-            ValidateIssuer = true,
-            IssuerValidator = TenantAllowListIssuerValidator.Build(builder.Configuration),
+        // ✅ exp / nbf strict with controlled skew
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromSeconds(Math.Clamp(hardening.ClockSkewSeconds, 0, 120)),
 
-            NameClaimType = "name",
-            RoleClaimType = "roles",
-        };
-
-        // Never persist tokens server-side.
-        options.SaveToken = false;
-
-        IdentityModelEventSource.ShowPII = builder.Environment.IsDevelopment();
-
-        options.Events = new JwtBearerEvents
+        // ✅ Algorithm whitelist (RS256/ES256)
+        // For Entra you can restrict to RS256 only if you want maximum strictness.
+        ValidAlgorithms = new[]
         {
-            OnAuthenticationFailed = ctx =>
+            SecurityAlgorithms.RsaSha256, // RS256
+            SecurityAlgorithms.EcdsaSha256 // ES256
+        },
+
+        NameClaimType = "name",
+        RoleClaimType = "roles",
+    };
+
+    // ✅ Key rollover safe (kid changes)
+    options.RefreshOnIssuerKeyNotFound = true;
+
+    options.SaveToken = false;
+
+    options.Events = new JwtBearerEvents
+    {
+        OnTokenValidated = async ctx =>
+        {
+            // Hard block "alg":"none" and any non-whitelisted alg (defense-in-depth)
+            if (ctx.SecurityToken is JwtSecurityToken jwt)
             {
-                // DO NOT log raw tokens. Log correlation info only.
-                ctx.HttpContext.Items["auth_failed"] = true;
-                return Task.CompletedTask;
+                var alg = jwt.Header.Alg;
+
+                if (string.Equals(alg, "none", StringComparison.OrdinalIgnoreCase))
+                {
+                    ctx.Fail("Rejected unsigned JWT (alg=none).");
+                    return;
+                }
+
+                // Whitelist check (defense-in-depth)
+                if (alg is null ||
+                    !(alg.Equals("RS256", StringComparison.OrdinalIgnoreCase) ||
+                      alg.Equals("ES256", StringComparison.OrdinalIgnoreCase)))
+                {
+                    ctx.Fail($"Rejected JWT with unsupported alg='{alg}'.");
+                    return;
+                }
             }
-        };
-    });
+
+            // Optional: add anti-replay / revocation checks here (next section)
+            var revocation = ctx.HttpContext.RequestServices.GetRequiredService<ITokenRevocationStore>();
+            var hard = ctx.HttpContext.RequestServices.GetRequiredService<IOptions<TokenHardeningOptions>>().Value;
+
+            if (hard.EnableJtiReplayProtection)
+            {
+                var jti = ctx.Principal?.FindFirstValue(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Jti);
+                if (string.IsNullOrWhiteSpace(jti))
+                {
+                    // You can choose to require jti strictly, but Entra doesn't always include it in access tokens.
+                    // If you want strict mode: ctx.Fail("Missing jti."); return;
+                }
+                else
+                {
+                    // 1) If token revoked -> block
+                    if (await revocation.IsRevokedAsync(jti, ctx.HttpContext.RequestAborted))
+                    {
+                        ctx.Fail("Token has been revoked.");
+                        return;
+                    }
+
+                    // 2) Replay protection: same jti seen again -> block (optional strict)
+                    // If you don't want strict replay block (e.g. same token reused legitimately), disable this.
+                    var replayOk = await revocation.TryMarkSeenAsync(jti, TimeSpan.FromMinutes(hard.JtiCacheMinutes), ctx.HttpContext.RequestAborted);
+                    if (!replayOk)
+                    {
+                        ctx.Fail("Token replay detected (jti reused).");
+                        return;
+                    }
+                }
+            }
+        },
+        OnAuthenticationFailed = ctx =>
+        {
+            ctx.HttpContext.Items["auth_failed"] = true;
+            return Task.CompletedTask;
+        }
+    };
+});
 
 // =====================================================
 // AuthZ (policies) — supports delegated scopes + app roles
@@ -96,6 +179,7 @@ builder.Services.AddAuthorization(options =>
 {
     AuthzPolicies.Configure(options, builder.Configuration);
 
+    // Delegate admin only direct policy
     options.AddPolicy("AdminOnly", p =>
     {
         p.RequireAuthenticatedUser();
@@ -107,57 +191,7 @@ builder.Services.AddAuthorization(options =>
 // Rate limiting — partition by identity (oid/appid) with IP fallback
 // mitigates: brute force, scraping, DoS logical (OWASP API4)
 // =====================================================
-//builder.Services.AddRateLimiter(o =>
-//{
-//    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
-//    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
-//    {
-//        // Prefer stable identity keys
-//        var user = ctx.User;
-//        var key =
-//            user.FindFirstValue("oid") ??
-//            user.FindFirstValue("appid") ??
-//            user.FindFirstValue("azp") ??
-//            ctx.Connection.RemoteIpAddress?.ToString() ??
-//            "anonymous";
-
-//        var limits = ctx.RequestServices.GetRequiredService<Microsoft.Extensions.Options.IOptions<RateLimitOptions>>().Value;
-
-//        // Two-level limiter: burst + sustained
-//        return RateLimitPartition.GetChainedLimiter(key,
-//            _ => new[]
-//            {
-//                RateLimitPartition.GetFixedWindowLimiter(
-//                    partitionKey: key + ":burst",
-//                    factory: _ => new FixedWindowRateLimiterOptions
-//                    {
-//                        PermitLimit = Math.Max(1, limits.BurstPer10Seconds),
-//                        Window = TimeSpan.FromSeconds(10),
-//                        QueueLimit = 0,
-//                        AutoReplenishment = true
-//                    }),
-//                RateLimitPartition.GetFixedWindowLimiter(
-//                    partitionKey: key + ":sustained",
-//                    factory: _ => new FixedWindowRateLimiterOptions
-//                    {
-//                        PermitLimit = Math.Max(1, limits.PerIdentityPerMinute),
-//                        Window = TimeSpan.FromMinutes(1),
-//                        QueueLimit = 0,
-//                        AutoReplenishment = true
-//                    })
-//            });
-//    });
-
-//    // Optional: endpoint-specific limiter (stricter for exports)
-//    o.AddFixedWindowLimiter("exports", opt =>
-//    {
-//        opt.PermitLimit = 60;
-//        opt.Window = TimeSpan.FromMinutes(1);
-//        opt.QueueLimit = 0;
-//        opt.AutoReplenishment = true;
-//    });
-//});
 builder.Services.AddRateLimiter(o =>
 {
     o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -243,6 +277,9 @@ builder.Services.AddSingleton<IMapper, ServiceMapper>();
 builder.Services.AddSingleton<ISyntheticIdService, SyntheticIdService>();
 builder.Services.AddSingleton<IRawDataService, InMemoryRawDataService>();
 builder.Services.AddSingleton<ICallRecordService, InMemoryCallRecordService>();
+builder.Services.AddSingleton<TokenAgeGuardMiddleware>();
+builder.Services.AddSingleton<BlockApiKeyOnSensitiveRoutesMiddleware>();
+builder.Services.AddSingleton<ITokenRevocationStore, DistributedTokenRevocationStore>();
 
 // =====================================================
 // Pipeline hardening
@@ -272,6 +309,10 @@ app.UseMiddleware<CorrelationIdMiddleware>();
 // Audit logging (request -> response) without leaking tokens/PII
 app.UseMiddleware<AuditMiddleware>();
 
+// 5) Evitar “DIY auth” (API keys sin controles) en datos sensibles
+app.UseMiddleware<BlockApiKeyOnSensitiveRoutesMiddleware>();
+
+
 app.UseSwagger();
 app.UseSwaggerUI(c =>
 {
@@ -280,6 +321,8 @@ app.UseSwaggerUI(c =>
 
 app.UseRateLimiter();
 app.UseAuthentication();
+// recommended: AFTER UseAuthentication so ctx.User is populated.
+app.UseMiddleware<TokenAgeGuardMiddleware>();
 app.UseAuthorization();
 
 // =====================================================
@@ -364,16 +407,24 @@ app.MapGet("/reports", (ClaimsPrincipal user) =>
 // =====================================================
 // RAW data export — hardened: rate limiting + safe field projection + synthetic IDs
 // =====================================================
-app.MapGet("/v1/raw-data", async (
+app.MapGet("/raw-data", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
-    ISyntheticIdService synth) =>
+    ISyntheticIdService synth,
+    ClaimsPrincipal user) =>
 {
+    var tenant = TenantContextFactory.From(user);
+
     // clamp limit to prevent resource abuse
     var take = Math.Clamp(q.Limit ?? 100, 1, 100);
 
-    var page = await dataSvc.QueryAsync(q.Filter, q.NextPageToken, take, http.RequestAborted);
+    //before
+    //var page = await dataSvc.QueryAsync(q.Filter, q.NextPageToken, take, http.RequestAborted);
+
+    // after
+    var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, http.RequestAborted);
+
 
     var items = page.Items.Select(r =>
     {
@@ -407,10 +458,12 @@ app.MapGet("/v1/raw-data", async (
 // =====================================================
 // Metadata export — inventory of exposed fields (OWASP API9)
 // =====================================================
-app.MapGet("/v1/export/metadata/call-records", async (
+app.MapGet("/export/metadata/call-records", async (
     ICallRecordService svc,
     IMapper mapper,
-    CancellationToken ct) =>
+    CancellationToken ct,
+    ClaimsPrincipal user
+    ) =>
 {
     var fields = ApiMetadataBuilder.BuildFor<CallRecord>();
 
@@ -437,11 +490,12 @@ app.MapGet("/v1/export/metadata/call-records", async (
 // =====================================================
 // Call records export — safe DTO only
 // =====================================================
-app.MapGet("/v1/export/call-records", async (
+app.MapGet("/export/call-records", async (
     ICallRecordService svc,
     IMapper mapper,
     ISyntheticIdService synth,
-    CancellationToken ct) =>
+    CancellationToken ct, 
+    ClaimsPrincipal user) =>
 {
     var records = await svc.GetSampleAsync(ct);
     var dto = mapper.Map<List<CallRecordExportDto>>(records);
@@ -461,6 +515,145 @@ app.MapGet("/v1/export/call-records", async (
 .RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 .WithOpenApi();
 
+
+app.MapGet("api/v1/call-records", async (
+    ICallRecordService svc,
+    IMapper mapper,
+    ISyntheticIdService synth,
+    CancellationToken ct,
+    ClaimsPrincipal user) =>
+{
+    var records = await svc.GetSampleAsync(ct);
+    var dto = mapper.Map<List<CallRecordExportDto>>(records);
+    for (var i = 0; i < dto.Count; i++)
+    {
+        var src = records[i];
+        dto[i] = dto[i] with { SyntheticCallId = synth.Create("call", src.CallId, src.InteractionId.ToString()) };
+    }
+
+    return Results.Ok(new
+    {
+        items = dto,
+        count = dto.Count
+    });
+}).AllowAnonymous()
+.RequireRateLimiting("exports")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
+
+app.MapGet("api/v1/raw-data", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    ClaimsPrincipal user) =>
+{
+    // ABAC
+    var tenant = TenantContextFactory.From(user);
+
+    // clamp limit to prevent resource abuse
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+    //before
+    //var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, ct);
+
+    // after
+    var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, http.RequestAborted);
+
+
+    var items = page.Items.Select(r =>
+    {
+        // Project safe fields only + apply masking if configured on attributes
+        var shape = FieldProjector.ToApiShape(r, synth);
+
+        // Provide a synthetic stable id for external correlation, without revealing internal IDs.
+        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+        return shape;
+    });
+
+    return Results.Ok(new
+    {
+        items,
+        page = new
+        {
+            limit = take,
+            nextPageToken = page.NextToken,
+            count = page.Items.Count
+        }
+    });
+})
+//.AllowAnonymous();
+.RequireRateLimiting("exports")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.Produces(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status401Unauthorized)
+.ProducesProblem(StatusCodes.Status403Forbidden)
+.ProducesProblem(StatusCodes.Status429TooManyRequests)
+.WithOpenApi();
+
+
+
+app.MapGet("api/v1/raw-data/ABAC", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    ClaimsPrincipal user) =>
+{
+    var tenantId = user.FindFirstValue("tid");
+    if (string.IsNullOrWhiteSpace(tenantId))
+        return Results.Forbid(); // or 401/403 per your preference
+
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+    var page = await dataSvc.QueryAsync(
+        tenantId,
+        q.Filter,
+        q.NextPageToken,
+        take,
+        http.RequestAborted);
+
+    var items = page.Items.Select(r =>
+    {
+        var shape = FieldProjector.ToApiShape(r, synth);
+        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+        return shape;
+    });
+
+    return Results.Ok(new
+    {
+        items,
+        page = new
+        {
+            limit = take,
+            nextPageToken = page.NextToken,
+            count = page.Items.Count
+        }
+    });
+})
+.RequireRateLimiting("exports")
+.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
+.WithOpenApi();
+
+
+
+app.MapPost("/security/revoke-token", async (
+    string jti,
+    ITokenRevocationStore store,
+    IOptions<TokenHardeningOptions> opt,
+    CancellationToken ct) =>
+{
+    // Revoke for the max age window (+ skew)
+    var ttl = TimeSpan.FromMinutes(opt.Value.MaxAccessTokenAgeMinutes + 5);
+    await store.RevokeAsync(jti, ttl, ct);
+    return Results.Ok(new { revoked = true, jti, ttlMinutes = ttl.TotalMinutes });
+})
+//.RequireAuthorization("AdminOnly")//
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
 app.Run();
 
 public record RawQuery(string? Filter, int? Limit, string? NextPageToken);
+
