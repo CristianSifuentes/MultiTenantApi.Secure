@@ -4,10 +4,12 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Logging;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using MultiTenantApi.Common;
+using MultiTenantApi.Infrastructure; // JsonWebToken (faster parser)
 using MultiTenantApi.Mapping;
 using MultiTenantApi.Middleware;
 using MultiTenantApi.Models;
@@ -17,8 +19,6 @@ using Serilog;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Threading.RateLimiting;
-using Microsoft.IdentityModel.JsonWebTokens;
-using MultiTenantApi.Infrastructure; // JsonWebToken (faster parser)
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -171,44 +171,6 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         }
     };
 });
-//builder.Services
-//    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-//    .AddJwtBearer(options =>
-//    {
-//        options.Authority = authority;
-
-//        // IMPORTANT: We validate audience explicitly to prevent tokens meant for other APIs being accepted.
-//        options.TokenValidationParameters = new TokenValidationParameters
-//        {
-//            ValidateAudience = true,
-//            ValidAudiences = new[]
-//            {
-//                audience,              // api://{clientId}
-//                azureAd["ClientId"]    // {clientId} (GUID) — helps tooling like Postman
-//            }.Where(x => !string.IsNullOrWhiteSpace(x)).ToArray(),
-
-//            ValidateIssuer = true,
-//            IssuerValidator = TenantAllowListIssuerValidator.Build(builder.Configuration),
-
-//            NameClaimType = "name",
-//            RoleClaimType = "roles",
-//        };
-
-//        // Never persist tokens server-side.
-//        options.SaveToken = false;
-
-//        IdentityModelEventSource.ShowPII = builder.Environment.IsDevelopment();
-
-//        options.Events = new JwtBearerEvents
-//        {
-//            OnAuthenticationFailed = ctx =>
-//            {
-//                // DO NOT log raw tokens. Log correlation info only.
-//                ctx.HttpContext.Items["auth_failed"] = true;
-//                return Task.CompletedTask;
-//            }
-//        };
-//    });
 
 // =====================================================
 // AuthZ (policies) — supports delegated scopes + app roles
@@ -449,13 +411,20 @@ app.MapGet("/raw-data", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
-    ISyntheticIdService synth, 
+    ISyntheticIdService synth,
     ClaimsPrincipal user) =>
 {
+    var tenant = TenantContextFactory.From(user);
+
     // clamp limit to prevent resource abuse
     var take = Math.Clamp(q.Limit ?? 100, 1, 100);
 
-    var page = await dataSvc.QueryAsync(q.Filter, q.NextPageToken, take, http.RequestAborted);
+    //before
+    //var page = await dataSvc.QueryAsync(q.Filter, q.NextPageToken, take, http.RequestAborted);
+
+    // after
+    var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, http.RequestAborted);
+
 
     var items = page.Items.Select(r =>
     {
@@ -547,6 +516,128 @@ app.MapGet("/export/call-records", async (
 .WithOpenApi();
 
 
+app.MapGet("api/v1/call-records", async (
+    ICallRecordService svc,
+    IMapper mapper,
+    ISyntheticIdService synth,
+    CancellationToken ct,
+    ClaimsPrincipal user) =>
+{
+    var records = await svc.GetSampleAsync(ct);
+    var dto = mapper.Map<List<CallRecordExportDto>>(records);
+    for (var i = 0; i < dto.Count; i++)
+    {
+        var src = records[i];
+        dto[i] = dto[i] with { SyntheticCallId = synth.Create("call", src.CallId, src.InteractionId.ToString()) };
+    }
+
+    return Results.Ok(new
+    {
+        items = dto,
+        count = dto.Count
+    });
+}).AllowAnonymous()
+.RequireRateLimiting("exports")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
+
+app.MapGet("api/v1/raw-data", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    ClaimsPrincipal user) =>
+{
+    // ABAC
+    var tenant = TenantContextFactory.From(user);
+
+    // clamp limit to prevent resource abuse
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+    //before
+    //var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, ct);
+
+    // after
+    var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, http.RequestAborted);
+
+
+    var items = page.Items.Select(r =>
+    {
+        // Project safe fields only + apply masking if configured on attributes
+        var shape = FieldProjector.ToApiShape(r, synth);
+
+        // Provide a synthetic stable id for external correlation, without revealing internal IDs.
+        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+        return shape;
+    });
+
+    return Results.Ok(new
+    {
+        items,
+        page = new
+        {
+            limit = take,
+            nextPageToken = page.NextToken,
+            count = page.Items.Count
+        }
+    });
+})
+//.AllowAnonymous();
+.RequireRateLimiting("exports")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.Produces(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status401Unauthorized)
+.ProducesProblem(StatusCodes.Status403Forbidden)
+.ProducesProblem(StatusCodes.Status429TooManyRequests)
+.WithOpenApi();
+
+
+
+app.MapGet("api/v1/raw-data/ABAC", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    ClaimsPrincipal user) =>
+{
+    var tenantId = user.FindFirstValue("tid");
+    if (string.IsNullOrWhiteSpace(tenantId))
+        return Results.Forbid(); // or 401/403 per your preference
+
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+    var page = await dataSvc.QueryAsync(
+        tenantId,
+        q.Filter,
+        q.NextPageToken,
+        take,
+        http.RequestAborted);
+
+    var items = page.Items.Select(r =>
+    {
+        var shape = FieldProjector.ToApiShape(r, synth);
+        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+        return shape;
+    });
+
+    return Results.Ok(new
+    {
+        items,
+        page = new
+        {
+            limit = take,
+            nextPageToken = page.NextToken,
+            count = page.Items.Count
+        }
+    });
+})
+.RequireRateLimiting("exports")
+.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
+.WithOpenApi();
+
+
+
 app.MapPost("/security/revoke-token", async (
     string jti,
     ITokenRevocationStore store,
@@ -566,58 +657,3 @@ app.Run();
 
 public record RawQuery(string? Filter, int? Limit, string? NextPageToken);
 
-
-
-
-
-//builder.Services.AddRateLimiter(o =>
-//{
-//    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-
-//    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
-//    {
-//        // Prefer stable identity keys
-//        var user = ctx.User;
-//        var key =
-//            user.FindFirstValue("oid") ??
-//            user.FindFirstValue("appid") ??
-//            user.FindFirstValue("azp") ??
-//            ctx.Connection.RemoteIpAddress?.ToString() ??
-//            "anonymous";
-
-//        var limits = ctx.RequestServices.GetRequiredService<Microsoft.Extensions.Options.IOptions<RateLimitOptions>>().Value;
-
-//        // Two-level limiter: burst + sustained
-//        return RateLimitPartition.GetChainedLimiter(key,
-//            _ => new[]
-//            {
-//                RateLimitPartition.GetFixedWindowLimiter(
-//                    partitionKey: key + ":burst",
-//                    factory: _ => new FixedWindowRateLimiterOptions
-//                    {
-//                        PermitLimit = Math.Max(1, limits.BurstPer10Seconds),
-//                        Window = TimeSpan.FromSeconds(10),
-//                        QueueLimit = 0,
-//                        AutoReplenishment = true
-//                    }),
-//                RateLimitPartition.GetFixedWindowLimiter(
-//                    partitionKey: key + ":sustained",
-//                    factory: _ => new FixedWindowRateLimiterOptions
-//                    {
-//                        PermitLimit = Math.Max(1, limits.PerIdentityPerMinute),
-//                        Window = TimeSpan.FromMinutes(1),
-//                        QueueLimit = 0,
-//                        AutoReplenishment = true
-//                    })
-//            });
-//    });
-
-//    // Optional: endpoint-specific limiter (stricter for exports)
-//    o.AddFixedWindowLimiter("exports", opt =>
-//    {
-//        opt.PermitLimit = 60;
-//        opt.Window = TimeSpan.FromMinutes(1);
-//        opt.QueueLimit = 0;
-//        opt.AutoReplenishment = true;
-//    });
-//});

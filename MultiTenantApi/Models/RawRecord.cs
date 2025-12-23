@@ -1,4 +1,4 @@
-namespace MultiTenantApi.Models;
+﻿namespace MultiTenantApi.Models;
 
 public sealed class RawRecord
 {
@@ -17,4 +17,7 @@ public sealed class RawRecord
     [ApiField("userId", Expose = false, IsIdentifier = true, IsSensitive = true, Masking = "synthetic-id",
         Description = "Internal user identifier. Never exposed in public exports.")]
     public string? UserInternalId { get; init; }
+
+    // ✅ ABAC attribute: tenant scoping
+    public string TenantId { get; set; } = default!;
 }
