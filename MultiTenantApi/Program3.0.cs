@@ -4,23 +4,21 @@
 //using Microsoft.AspNetCore.HttpOverrides;
 //using Microsoft.AspNetCore.RateLimiting;
 //using Microsoft.Extensions.Options;
-//using Microsoft.IdentityModel.JsonWebTokens;
 //using Microsoft.IdentityModel.Logging;
 //using Microsoft.IdentityModel.Tokens;
 //using Microsoft.OpenApi.Models;
 //using MultiTenantApi.Common;
-//using MultiTenantApi.Infrastructure; // JsonWebToken (faster parser)
 //using MultiTenantApi.Mapping;
 //using MultiTenantApi.Middleware;
 //using MultiTenantApi.Models;
 //using MultiTenantApi.Security;
 //using MultiTenantApi.Services;
 //using Serilog;
-//using System.ComponentModel;
 //using System.IdentityModel.Tokens.Jwt;
 //using System.Security.Claims;
 //using System.Threading.RateLimiting;
-//using static System.Net.WebRequestMethods;
+//using Microsoft.IdentityModel.JsonWebTokens;
+//using MultiTenantApi.Infrastructure; // JsonWebToken (faster parser)
 
 //var builder = WebApplication.CreateBuilder(args);
 
@@ -173,6 +171,44 @@
 //        }
 //    };
 //});
+////builder.Services
+////    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+////    .AddJwtBearer(options =>
+////    {
+////        options.Authority = authority;
+
+////        // IMPORTANT: We validate audience explicitly to prevent tokens meant for other APIs being accepted.
+////        options.TokenValidationParameters = new TokenValidationParameters
+////        {
+////            ValidateAudience = true,
+////            ValidAudiences = new[]
+////            {
+////                audience,              // api://{clientId}
+////                azureAd["ClientId"]    // {clientId} (GUID) — helps tooling like Postman
+////            }.Where(x => !string.IsNullOrWhiteSpace(x)).ToArray(),
+
+////            ValidateIssuer = true,
+////            IssuerValidator = TenantAllowListIssuerValidator.Build(builder.Configuration),
+
+////            NameClaimType = "name",
+////            RoleClaimType = "roles",
+////        };
+
+////        // Never persist tokens server-side.
+////        options.SaveToken = false;
+
+////        IdentityModelEventSource.ShowPII = builder.Environment.IsDevelopment();
+
+////        options.Events = new JwtBearerEvents
+////        {
+////            OnAuthenticationFailed = ctx =>
+////            {
+////                // DO NOT log raw tokens. Log correlation info only.
+////                ctx.HttpContext.Items["auth_failed"] = true;
+////                return Task.CompletedTask;
+////            }
+////        };
+////    });
 
 //// =====================================================
 //// AuthZ (policies) — supports delegated scopes + app roles
@@ -189,163 +225,57 @@
 //    });
 //});
 
-
+//// =====================================================
+//// Rate limiting — partition by identity (oid/appid) with IP fallback
+//// mitigates: brute force, scraping, DoS logical (OWASP API4)
+//// =====================================================
 
 //builder.Services.AddRateLimiter(o =>
 //{
 //    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
-//    // 1) GLOBAL: user/client/ip (general anti-abuse)
 //    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
 //    {
+//        var user = ctx.User;
+
 //        var key =
-//            RateLimitKeyFactory.GetUserKey(ctx) != "user:anonymous"
-//                ? RateLimitKeyFactory.GetUserKey(ctx)
-//                : RateLimitKeyFactory.GetClientKey(ctx) != "client:anonymous"
-//                    ? RateLimitKeyFactory.GetClientKey(ctx)
-//                    : RateLimitKeyFactory.GetIpFallback(ctx);
+//            user.FindFirstValue("oid") ??
+//            user.FindFirstValue("appid") ??
+//            user.FindFirstValue("azp") ??
+//            ctx.Connection.RemoteIpAddress?.ToString() ??
+//            "anonymous";
 
-//        // Usa tus RateLimitOptions actuales aquí
-//        var limits = ctx.RequestServices.GetRequiredService<IOptions<RateLimitOptions>>().Value;
+//        var limits = ctx.RequestServices
+//            .GetRequiredService<Microsoft.Extensions.Options.IOptions<RateLimitOptions>>()
+//            .Value;
 
+//        // TokenBucket = burst + sustained en un solo limiter (sin chaining)
+//        // - TokenLimit: tamaño del burst
+//        // - TokensPerPeriod/ReplenishmentPeriod: ritmo sostenido
 //        return RateLimitPartition.GetTokenBucketLimiter(
 //            partitionKey: key,
 //            factory: _ => new TokenBucketRateLimiterOptions
 //            {
 //                TokenLimit = Math.Max(1, limits.BurstPer10Seconds),
-//                TokensPerPeriod = Math.Max(1, limits.PerIdentityPerMinute),
-//                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
 //                QueueLimit = 0,
 //                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+
+//                // Sostenido por minuto:
+//                TokensPerPeriod = Math.Max(1, limits.PerIdentityPerMinute),
+//                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
 //                AutoReplenishment = true
 //            });
 //    });
 
-//    // 2) ENDPOINT POLICIES: tenant fairness
-//    o.AddPolicy("exports-tenant", ctx =>
+//    // Endpoint-specific limiter (exports) - lo puedes dejar igual
+//    o.AddFixedWindowLimiter("exports", opt =>
 //    {
-//        var opt = ctx.RequestServices.GetRequiredService<IOptions<RateLimitingEnterpriseOptions>>().Value;
-//        var key = RateLimitKeyFactory.GetTenantKey(ctx);
-
-//        return RateLimitPartition.GetFixedWindowLimiter(
-//            partitionKey: key,
-//            factory: _ => new FixedWindowRateLimiterOptions
-//            {
-//                PermitLimit = Math.Max(1, opt.Exports.PerTenantPerMinute),
-//                Window = TimeSpan.FromMinutes(1),
-//                QueueLimit = 0,
-//                AutoReplenishment = true
-//            });
-//    });
-
-//    o.AddPolicy("search-tenant", ctx =>
-//    {
-//        var opt = ctx.RequestServices.GetRequiredService<IOptions<RateLimitingEnterpriseOptions>>().Value;
-//        var key = RateLimitKeyFactory.GetTenantKey(ctx);
-
-//        return RateLimitPartition.GetFixedWindowLimiter(
-//            partitionKey: key,
-//            factory: _ => new FixedWindowRateLimiterOptions
-//            {
-//                PermitLimit = Math.Max(1, opt.Search.PerTenantPerMinute),
-//                Window = TimeSpan.FromMinutes(1),
-//                QueueLimit = 0,
-//                AutoReplenishment = true
-//            });
-//    });
-
-//    // 3) LOGIN: per-IP + per-client (anti credential stuffing)
-//    o.AddPolicy("login", ctx =>
-//    {
-//        var opt = ctx.RequestServices.GetRequiredService<IOptions<RateLimitingEnterpriseOptions>>().Value;
-//        var ip = RateLimitKeyFactory.GetIpFallback(ctx);
-
-//        return RateLimitPartition.GetFixedWindowLimiter(
-//            partitionKey: ip,
-//            factory: _ => new FixedWindowRateLimiterOptions
-//            {
-//                PermitLimit = Math.Max(1, opt.Login.PerIpPerMinute),
-//                Window = TimeSpan.FromMinutes(1),
-//                QueueLimit = 0,
-//                AutoReplenishment = true
-//            });
-//    });
-
-//    //6) “Impresionante” nivel enterprise: rate limit por client_id explícito en policies
-//    o.AddPolicy("exports-client", ctx =>
-//    {
-//        var opt = ctx.RequestServices.GetRequiredService<IOptions<RateLimitingEnterpriseOptions>>().Value;
-//        var key = RateLimitKeyFactory.GetClientKey(ctx);
-
-//        return RateLimitPartition.GetFixedWindowLimiter(
-//            partitionKey: key,
-//            factory: _ => new FixedWindowRateLimiterOptions
-//            {
-//                PermitLimit = Math.Max(1, opt.Exports.PerClientPerMinute),
-//                Window = TimeSpan.FromMinutes(1),
-//                QueueLimit = 0,
-//                AutoReplenishment = true
-//            });
+//        opt.PermitLimit = 60;
+//        opt.Window = TimeSpan.FromMinutes(1);
+//        opt.QueueLimit = 0;
+//        opt.AutoReplenishment = true;
 //    });
 //});
-
-
-
-
-
-
-
-
-//// =====================================================
-//// Rate limiting — partition by identity (oid/appid) with IP fallback
-//// mitigates: brute force, scraping, DoS logical (OWASP API4)
-//// =====================================================
-////builder.Services.AddRateLimiter(o =>
-////{
-////    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-
-////    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
-////    {
-////        var user = ctx.User;
-
-////        var key =
-////            user.FindFirstValue("oid") ??
-////            user.FindFirstValue("appid") ??
-////            user.FindFirstValue("azp") ??
-////            ctx.Connection.RemoteIpAddress?.ToString() ??
-////            "anonymous";
-
-////        var limits = ctx.RequestServices
-////            .GetRequiredService<Microsoft.Extensions.Options.IOptions<RateLimitOptions>>()
-////            .Value;
-
-////        // TokenBucket = burst + sustained en un solo limiter (sin chaining)
-////        // - TokenLimit: tamaño del burst
-////        // - TokensPerPeriod/ReplenishmentPeriod: ritmo sostenido
-////        return RateLimitPartition.GetTokenBucketLimiter(
-////            partitionKey: key,
-////            factory: _ => new TokenBucketRateLimiterOptions
-////            {
-////                TokenLimit = Math.Max(1, limits.BurstPer10Seconds),
-////                QueueLimit = 0,
-////                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-
-////                // Sostenido por minuto:
-////                TokensPerPeriod = Math.Max(1, limits.PerIdentityPerMinute),
-////                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
-////                AutoReplenishment = true
-////            });
-////    });
-
-////    // Endpoint-specific limiter (exports) - lo puedes dejar igual
-////    o.AddFixedWindowLimiter("exports", opt =>
-////    {
-////        opt.PermitLimit = 60;
-////        opt.Window = TimeSpan.FromMinutes(1);
-////        opt.QueueLimit = 0;
-////        opt.AutoReplenishment = true;
-////    });
-////});
 
 //// =====================================================
 //// Swagger (OpenAPI) — bearer auth
@@ -388,8 +318,6 @@
 //builder.Services.AddSingleton<TokenAgeGuardMiddleware>();
 //builder.Services.AddSingleton<BlockApiKeyOnSensitiveRoutesMiddleware>();
 //builder.Services.AddSingleton<ITokenRevocationStore, DistributedTokenRevocationStore>();
-//builder.Services.Configure<RateLimitingEnterpriseOptions>(
-//    builder.Configuration.GetSection("RateLimitingEnterprise"));
 
 //// =====================================================
 //// Pipeline hardening
@@ -478,8 +406,6 @@
 //.RequireAuthorization()
 //.WithOpenApi();
 
-
-
 //// =====================================================
 //// Secure sample endpoints
 //// =====================================================
@@ -526,17 +452,10 @@
 //    ISyntheticIdService synth,
 //    ClaimsPrincipal user) =>
 //{
-//    var tenant = TenantContextFactory.From(user);
-
 //    // clamp limit to prevent resource abuse
 //    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
 
-//    //before
-//    //var page = await dataSvc.QueryAsync(q.Filter, q.NextPageToken, take, http.RequestAborted);
-
-//    // after
-//    var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, http.RequestAborted);
-
+//    var page = await dataSvc.QueryAsync(q.Filter, q.NextPageToken, take, http.RequestAborted);
 
 //    var items = page.Items.Select(r =>
 //    {
@@ -559,13 +478,13 @@
 //        }
 //    });
 //})
-////.RequireRateLimiting("exports")
+//.RequireRateLimiting("exports")
 //.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
 //.Produces(StatusCodes.Status200OK)
 //.ProducesProblem(StatusCodes.Status401Unauthorized)
 //.ProducesProblem(StatusCodes.Status403Forbidden)
 //.ProducesProblem(StatusCodes.Status429TooManyRequests)
-//.WithOpenApi();
+//s.WithOpenApi();
 
 //// =====================================================
 //// Metadata export — inventory of exposed fields (OWASP API9)
@@ -591,7 +510,7 @@
 
 //    return Results.Ok(response);
 //})
-//.RequireRateLimiting("exports-tenant")
+//.RequireRateLimiting("exports")
 //.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 //.Produces<EntityMetadataResponse<CallRecordExportDto>>(StatusCodes.Status200OK)
 //.ProducesProblem(StatusCodes.Status401Unauthorized)
@@ -606,7 +525,7 @@
 //    ICallRecordService svc,
 //    IMapper mapper,
 //    ISyntheticIdService synth,
-//    CancellationToken ct,
+//    CancellationToken ct, 
 //    ClaimsPrincipal user) =>
 //{
 //    var records = await svc.GetSampleAsync(ct);
@@ -623,287 +542,9 @@
 //        count = dto.Count
 //    });
 //})
-////.RequireRateLimiting("exports")
-//.RequireRateLimiting("exports-tenant")
-//.AllowAnonymous()
-////.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-//.WithOpenApi();
-
-
-
-////En tu caso con Entra, “login” vive fuera, pero aplica perfecto a:
-///// password - reset / request
-///// send - otp
-///// invite
-///// onboarding / start
-////(flujos sensibles OWASP API6)
-
-
-//// =====================================================
-//// SEARCH — hardened: ABAC tenant scope + strict validation + cursor pagination
-//// Threats: OWASP API4 (resource consumption), API1 (BOLA via cross-tenant), scraping/fuzzing
-//// =====================================================
-////app.MapGet("/search", async (
-////    HttpContext http,
-////    [AsParameters] SearchQuery q,
-////    ClaimsPrincipal user,
-////    IRawDataService dataSvc,
-////    ISyntheticIdService synth) =>
-////{
-////    // ✅ ABAC: tenant scoping (deny-by-default)
-////    var tenant = TenantContextFactory.From(user);
-////    if (string.IsNullOrWhiteSpace(tenant.TenantId))
-////        return Results.Forbid();
-
-////    // ✅ Validate BEFORE touching data layer (cheap rejection)
-////    var v = SearchQueryValidator.Validate(q);
-////    if (!v.ok)
-////    {
-////        // consistent error shape (do not leak details)
-////        return Results.BadRequest(new
-////        {
-////            error = "invalid_query",
-////            message = v.error
-////        });
-////    }
-
-////    // ✅ Hard clamp (defense-in-depth)
-////    var take = Math.Clamp(q.Limit ?? 25, 1, 100);
-
-////    // ✅ ABAC enforcement at the data layer: pass tenantId
-////    var page = await dataSvc.SearchAsync(
-////        tenantId: tenant.TenantId,
-////        query: q.Query!,
-////        channels: q.Channels,
-////        fromUtc: q.FromUtc,
-////        toUtc: q.ToUtc,
-////        nextToken: q.NextPageToken,
-////        take: take,
-////        ct: http.RequestAborted);
-
-////    // ✅ Deny-by-default projection (never return domain raw object directly)
-////    // Only return "safe" fields + synthetic stable id
-////    var items = page.Items.Select(r =>
-////    {
-////        var shape = new Dictionary<string, object?>
-////        {
-////            ["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N")),
-////            ["createdAt"] = r.CreatedAt,
-////            ["channel"] = r.Channel,
-////            ["textPreview"] = SearchQueryValidator.SafePreview(r.Text, maxLen: 160)
-////        };
-
-////        // Optionally: expose a stable synthetic user id (avoid leaking real internal user ids)
-////        shape["syntheticUserId"] = string.IsNullOrWhiteSpace(r.UserInternalId)
-////            ? null
-////            : synth.Create("user", r.UserInternalId);
-
-////        return shape;
-////    });
-
-////    return Results.Ok(new
-////    {
-////        tenantId = tenant.TenantId,
-////        query = new
-////        {
-////            q = q.Query,
-////            channels = q.Channels,
-////            fromUtc = q.FromUtc,
-////            toUtc = q.ToUtc,
-////            limit = take
-////        },
-////        items,
-////        page = new
-////        {
-////            nextPageToken = page.NextToken,
-////            count = page.Items.Count
-////        }
-////    });
-////})
-////.RequireRateLimiting("search-tenant")
-////.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName) // or create a Search policy
-////.Produces(StatusCodes.Status200OK)
-////.ProducesProblem(StatusCodes.Status401Unauthorized)
-////.ProducesProblem(StatusCodes.Status403Forbidden)
-////.ProducesProblem(StatusCodes.Status429TooManyRequests)
-////.WithOpenApi();
-
-
-//app.MapGet("api/v1/call-records", async (
-//    ICallRecordService svc,
-//    IMapper mapper,
-//    ISyntheticIdService synth,
-//    CancellationToken ct,
-//    ClaimsPrincipal user) =>
-//{
-//    var records = await svc.GetSampleAsync(ct);
-//    var dto = mapper.Map<List<CallRecordExportDto>>(records);
-//    for (var i = 0; i < dto.Count; i++)
-//    {
-//        var src = records[i];
-//        dto[i] = dto[i] with { SyntheticCallId = synth.Create("call", src.CallId, src.InteractionId.ToString()) };
-//    }
-
-//    return Results.Ok(new
-//    {
-//        items = dto,
-//        count = dto.Count
-//    });
-//})
-////.RequireRateLimiting("exports")
-//.RequireRateLimiting("exports-tenant")
+//.RequireRateLimiting("exports")
 //.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 //.WithOpenApi();
-
-
-//app.MapGet("api/v1/raw-data", async (
-//    HttpContext http,
-//    [AsParameters] RawQuery q,
-//    IRawDataService dataSvc,
-//    ISyntheticIdService synth,
-//    ClaimsPrincipal user) =>
-//{
-//    // ABAC
-//    var tenant = TenantContextFactory.From(user);
-
-//    // clamp limit to prevent resource abuse
-//    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
-
-//    //before
-//    //var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, ct);
-
-//    // after
-//    var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, http.RequestAborted);
-
-
-//    var items = page.Items.Select(r =>
-//    {
-//        // Project safe fields only + apply masking if configured on attributes
-//        var shape = FieldProjector.ToApiShape(r, synth);
-
-//        // Provide a synthetic stable id for external correlation, without revealing internal IDs.
-//        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
-//        return shape;
-//    });
-
-//    return Results.Ok(new
-//    {
-//        items,
-//        page = new
-//        {
-//            limit = take,
-//            nextPageToken = page.NextToken,
-//            count = page.Items.Count
-//        }
-//    });
-//})
-//.AllowAnonymous();
-////.RequireRateLimiting("exports-tenant")
-////.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-////.Produces(StatusCodes.Status200OK)
-////.ProducesProblem(StatusCodes.Status401Unauthorized)
-////.ProducesProblem(StatusCodes.Status403Forbidden)
-////.ProducesProblem(StatusCodes.Status429TooManyRequests)
-////.WithOpenApi();
-
-
-
-//app.MapGet("api/v1/raw-data/ABAC", async (
-//    HttpContext http,
-//    [AsParameters] RawQuery q,
-//    IRawDataService dataSvc,
-//    ISyntheticIdService synth,
-//    ClaimsPrincipal user) =>
-//{
-//    var tenantId = user.FindFirstValue("tid");
-//    if (string.IsNullOrWhiteSpace(tenantId))
-//        return Results.Forbid(); // or 401/403 per your preference
-
-//    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
-
-//    var page = await dataSvc.QueryAsync(
-//        tenantId,
-//        q.Filter,
-//        q.NextPageToken,
-//        take,
-//        http.RequestAborted);
-
-//    var items = page.Items.Select(r =>
-//    {
-//        var shape = FieldProjector.ToApiShape(r, synth);
-//        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
-//        return shape;
-//    });
-
-//    return Results.Ok(new
-//    {
-//        items,
-//        page = new
-//        {
-//            limit = take,
-//            nextPageToken = page.NextToken,
-//            count = page.Items.Count
-//        }
-//    });
-//})
-//.RequireRateLimiting("exports-tenant")
-//.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
-//.WithOpenApi();
-
-
-//app.MapGet("api/v1/raw-data/ABAC/early-rejection-cheap", async (
-//    HttpContext http,
-//    [AsParameters] RawQuery q,
-//    IRawDataService dataSvc,
-//    ISyntheticIdService synth,
-//    ClaimsPrincipal user) =>
-//{
-//    var tenantId = user.FindFirstValue("tid");
-//    if (string.IsNullOrWhiteSpace(tenantId))
-//        return Results.Forbid(); // or 401/403 per your preference
-
-//    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
-
-//    // ✅ validate before hitting data layer
-//    var v = RawQueryValidator.Validate(q.Filter, q.NextPageToken, take);
-//    if (!v.ok)
-//    {
-//        return Results.BadRequest(new
-//        {
-//            error = "invalid_query",
-//            message = v.error
-//        });
-//    }
-
-//    var page = await dataSvc.QueryAsync(
-//        tenantId,
-//        q.Filter,
-//        q.NextPageToken,
-//        take,
-//        http.RequestAborted);
-
-//    var items = page.Items.Select(r =>
-//    {
-//        var shape = FieldProjector.ToApiShape(r, synth);
-//        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
-//        return shape;
-//    });
-
-//    return Results.Ok(new
-//    {
-//        items,
-//        page = new
-//        {
-//            limit = take,
-//            nextPageToken = page.NextToken,
-//            count = page.Items.Count
-//        }
-//    });
-//})
-//.RequireRateLimiting("exports-tenant")
-//.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
-//.WithOpenApi();
-
 
 
 //app.MapPost("/security/revoke-token", async (
@@ -924,10 +565,59 @@
 //app.Run();
 
 //public record RawQuery(string? Filter, int? Limit, string? NextPageToken);
-//public sealed record SearchQuery(
-//    string? Query,
-//    string[]? Channels,
-//    DateTimeOffset? FromUtc,
-//    DateTimeOffset? ToUtc,
-//    int? Limit,
-//    string? NextPageToken);
+
+
+
+
+
+////builder.Services.AddRateLimiter(o =>
+////{
+////    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+////    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
+////    {
+////        // Prefer stable identity keys
+////        var user = ctx.User;
+////        var key =
+////            user.FindFirstValue("oid") ??
+////            user.FindFirstValue("appid") ??
+////            user.FindFirstValue("azp") ??
+////            ctx.Connection.RemoteIpAddress?.ToString() ??
+////            "anonymous";
+
+////        var limits = ctx.RequestServices.GetRequiredService<Microsoft.Extensions.Options.IOptions<RateLimitOptions>>().Value;
+
+////        // Two-level limiter: burst + sustained
+////        return RateLimitPartition.GetChainedLimiter(key,
+////            _ => new[]
+////            {
+////                RateLimitPartition.GetFixedWindowLimiter(
+////                    partitionKey: key + ":burst",
+////                    factory: _ => new FixedWindowRateLimiterOptions
+////                    {
+////                        PermitLimit = Math.Max(1, limits.BurstPer10Seconds),
+////                        Window = TimeSpan.FromSeconds(10),
+////                        QueueLimit = 0,
+////                        AutoReplenishment = true
+////                    }),
+////                RateLimitPartition.GetFixedWindowLimiter(
+////                    partitionKey: key + ":sustained",
+////                    factory: _ => new FixedWindowRateLimiterOptions
+////                    {
+////                        PermitLimit = Math.Max(1, limits.PerIdentityPerMinute),
+////                        Window = TimeSpan.FromMinutes(1),
+////                        QueueLimit = 0,
+////                        AutoReplenishment = true
+////                    })
+////            });
+////    });
+
+////    // Optional: endpoint-specific limiter (stricter for exports)
+////    o.AddFixedWindowLimiter("exports", opt =>
+////    {
+////        opt.PermitLimit = 60;
+////        opt.Window = TimeSpan.FromMinutes(1);
+////        opt.QueueLimit = 0;
+////        opt.AutoReplenishment = true;
+////    });
+////});
