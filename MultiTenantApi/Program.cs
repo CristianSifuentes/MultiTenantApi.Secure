@@ -50,8 +50,16 @@ var audience = azureAd["Audience"]
     ?? throw new InvalidOperationException("AzureAd:Audience is required (e.g., api://{API_CLIENT_ID}).");
 
 builder.Services.Configure<SyntheticIdOptions>(builder.Configuration.GetSection("SyntheticId"));
-builder.Services.Configure<RateLimitOptions>(builder.Configuration.GetSection("RateLimiting"));
 
+////existe ya una forma donde se hace una inyección de dependencias de 
+//// una sección de en el appsetting de nombre "RateLimiting"
+////"RateLimiting": {
+////    "PerIdentityPerMinute": 300,
+////    "BurstPer10Seconds": 50
+////  }, analizar ver el tema de las opciones avanzadas, comente el servicio y el appsetting
+//builder.Services.Configure<RateLimitOptions>(builder.Configuration.GetSection("RateLimiting"));
+builder.Services.Configure<RateLimitingEnterpriseOptions>(
+    builder.Configuration.GetSection("RateLimitingEnterprise"));
 
 builder.Services.AddDistributedMemoryCache(); // dev
 
@@ -193,6 +201,10 @@ builder.Services.AddAuthorization(options =>
 
 builder.Services.AddRateLimiter(o =>
 {
+
+
+    //La idea: para exports/ search aplicas tres limiters en paralelo(tenant + client + user).
+    //¿Que es GetChainedLimiter?
     o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
     // 1) GLOBAL: user/client/ip (general anti-abuse)
@@ -287,13 +299,17 @@ builder.Services.AddRateLimiter(o =>
                 AutoReplenishment = true
             });
     });
+
+    // Cómo lo usas(esto es lo importante)
+    // Exports:
+    //  .RequireRateLimiting("exports-tenant")
+    //  y además GlobalLimiter ya aplica por user / client / ip automáticamente.
+    // Search:
+    //  .RequireRateLimiting("search-tenant")
+    // Login endpoints:
+    //  .RequireRateLimiting("login")
+
 });
-
-
-
-
-
-
 
 
 // =====================================================
@@ -388,8 +404,7 @@ builder.Services.AddSingleton<ICallRecordService, InMemoryCallRecordService>();
 builder.Services.AddSingleton<TokenAgeGuardMiddleware>();
 builder.Services.AddSingleton<BlockApiKeyOnSensitiveRoutesMiddleware>();
 builder.Services.AddSingleton<ITokenRevocationStore, DistributedTokenRevocationStore>();
-builder.Services.Configure<RateLimitingEnterpriseOptions>(
-    builder.Configuration.GetSection("RateLimitingEnterprise"));
+
 
 // =====================================================
 // Pipeline hardening
@@ -559,7 +574,7 @@ app.MapGet("/raw-data", async (
         }
     });
 })
-//.RequireRateLimiting("exports")
+.RequireRateLimiting("exports-tenant")
 .RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
 .Produces(StatusCodes.Status200OK)
 .ProducesProblem(StatusCodes.Status401Unauthorized)
@@ -623,10 +638,8 @@ app.MapGet("/export/call-records", async (
         count = dto.Count
     });
 })
-//.RequireRateLimiting("exports")
 .RequireRateLimiting("exports-tenant")
-.AllowAnonymous()
-//.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 .WithOpenApi();
 
 
@@ -750,7 +763,6 @@ app.MapGet("api/v1/call-records", async (
         count = dto.Count
     });
 })
-//.RequireRateLimiting("exports")
 .RequireRateLimiting("exports-tenant")
 .RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 .WithOpenApi();
@@ -797,14 +809,13 @@ app.MapGet("api/v1/raw-data", async (
         }
     });
 })
-.AllowAnonymous();
-//.RequireRateLimiting("exports-tenant")
-//.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-//.Produces(StatusCodes.Status200OK)
-//.ProducesProblem(StatusCodes.Status401Unauthorized)
-//.ProducesProblem(StatusCodes.Status403Forbidden)
-//.ProducesProblem(StatusCodes.Status429TooManyRequests)
-//.WithOpenApi();
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.Produces(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status401Unauthorized)
+.ProducesProblem(StatusCodes.Status403Forbidden)
+.ProducesProblem(StatusCodes.Status429TooManyRequests)
+.WithOpenApi();
 
 
 
