@@ -16,6 +16,7 @@ using MultiTenantApi.Models;
 using MultiTenantApi.Security;
 using MultiTenantApi.Services;
 using Serilog;
+using System;
 using System.ComponentModel;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
@@ -30,8 +31,12 @@ var builder = WebApplication.CreateBuilder(args);
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
     .Enrich.FromLogContext()
+    // 🔥 evita que logs “accidentalmente” lleven headers peligrosos
+    .Enrich.With(new RedactSensitiveHeadersEnricher(
+        new HttpContextAccessor())) // en prod, mejor resolverlo desde DI (ver nota abajo)
     .WriteTo.Console()
     .CreateLogger();
+
 
 builder.Host.UseSerilog();
 
@@ -120,6 +125,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     // ✅ Key rollover safe (kid changes)
     options.RefreshOnIssuerKeyNotFound = true;
 
+    // (bien: no persistes tokens)
     options.SaveToken = false;
 
     options.Events = new JwtBearerEvents
@@ -415,6 +421,9 @@ builder.Services.AddSingleton<ITokenRevocationStore, DistributedTokenRevocationS
 builder.Services.AddSingleton<RequestLimitsMiddleware>();
 // WafSignalsMiddleware (detección + scoring + logging + “bot hints”)
 builder.Services.AddSingleton<WafSignalsMiddleware>();
+// 1) “Nunca secrets en URLs” — dónde se implementa y cómo
+builder.Services.AddSingleton<DenySecretsInUrlMiddleware>();
+
 
 #endregion
 
@@ -461,6 +470,8 @@ app.UseMiddleware<RequestLimitsMiddleware>();
 //4.2 WafSignalsMiddleware (detección + scoring + logging + “bot hints”)
 app.UseMiddleware<WafSignalsMiddleware>();
 
+// 1) “Nunca secrets en URLs” — dónde se implementa y cómo
+app.UseMiddleware<DenySecretsInUrlMiddleware>();
 
 #endregion
 
