@@ -61,6 +61,11 @@ builder.Services.Configure<SyntheticIdOptions>(builder.Configuration.GetSection(
 builder.Services.Configure<RateLimitingEnterpriseOptions>(
     builder.Configuration.GetSection("RateLimitingEnterprise"));
 
+// Esto NO reemplaza WAF, pero hace tu app resistente incluso si el WAF falla o está mal configurado. 
+builder.Services.Configure<RequestLimitsOptions>(builder.Configuration.GetSection("RequestLimits"));
+
+
+
 builder.Services.AddDistributedMemoryCache(); // dev
 
 
@@ -395,15 +400,25 @@ builder.Services.AddSwaggerGen(o =>
 // Mapster + Services (exports)
 // =====================================================
 MapsterConfig.RegisterMaps();
+
+
+#region DependencyInjection (DI) 
 builder.Services.AddSingleton(TypeAdapterConfig.GlobalSettings);
 builder.Services.AddSingleton<IMapper, ServiceMapper>();
-
 builder.Services.AddSingleton<ISyntheticIdService, SyntheticIdService>();
 builder.Services.AddSingleton<IRawDataService, InMemoryRawDataService>();
 builder.Services.AddSingleton<ICallRecordService, InMemoryCallRecordService>();
 builder.Services.AddSingleton<TokenAgeGuardMiddleware>();
 builder.Services.AddSingleton<BlockApiKeyOnSensitiveRoutesMiddleware>();
 builder.Services.AddSingleton<ITokenRevocationStore, DistributedTokenRevocationStore>();
+//Esto NO reemplaza WAF, pero hace tu app resistente incluso si el WAF falla o está mal configurado.
+builder.Services.AddSingleton<RequestLimitsMiddleware>();
+// WafSignalsMiddleware (detección + scoring + logging + “bot hints”)
+builder.Services.AddSingleton<WafSignalsMiddleware>();
+
+#endregion
+
+
 
 
 // =====================================================
@@ -423,9 +438,12 @@ app.UseExceptionHandler("/error");
 
 // Enforce HTTPS at the edge and inside app (defense-in-depth)
 app.UseHsts();
+
+#region Middleware
 app.UseMiddleware<EnforceHttpsMiddleware>();
 
 // Security headers (clickjacking, MIME sniffing, etc.)
+// Necesitamos ver de donde salio?? y que hace??
 app.UseMiddleware<SecurityHeadersMiddleware>();
 
 // Correlation ID for audit + tracing
@@ -436,6 +454,15 @@ app.UseMiddleware<AuditMiddleware>();
 
 // 5) Evitar “DIY auth” (API keys sin controles) en datos sensibles
 app.UseMiddleware<BlockApiKeyOnSensitiveRoutesMiddleware>();
+
+//Esto NO reemplaza WAF, pero hace tu app resistente incluso si el WAF falla o está mal configurado.
+app.UseMiddleware<RequestLimitsMiddleware>();
+
+//4.2 WafSignalsMiddleware (detección + scoring + logging + “bot hints”)
+app.UseMiddleware<WafSignalsMiddleware>();
+
+
+#endregion
 
 
 app.UseSwagger();
