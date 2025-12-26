@@ -1,10 +1,5 @@
-//using System.IdentityModel.Tokens.Jwt;
-//using System.Security.Claims;
-//using System.Threading.RateLimiting;
-
 //using Mapster;
 //using MapsterMapper;
-
 //using Microsoft.AspNetCore.Authentication.JwtBearer;
 //using Microsoft.AspNetCore.HttpOverrides;
 //using Microsoft.AspNetCore.RateLimiting;
@@ -12,7 +7,6 @@
 //using Microsoft.IdentityModel.Logging;
 //using Microsoft.IdentityModel.Tokens;
 //using Microsoft.OpenApi.Models;
-
 //using MultiTenantApi.Common;
 //using MultiTenantApi.Infrastructure;
 //// JsonWebToken (faster parser)
@@ -21,8 +15,12 @@
 //using MultiTenantApi.Models;
 //using MultiTenantApi.Security;
 //using MultiTenantApi.Services;
-
 //using Serilog;
+//using System.IdentityModel.Tokens.Jwt;
+//using System.Security.Claims;
+//using System.Security.Cryptography;
+//using System.Text;
+//using System.Threading.RateLimiting;
 
 //// =====================================================
 //// Builder
@@ -57,7 +55,16 @@
 //    ?? throw new InvalidOperationException("AzureAd:Audience is required (e.g., api://{API_CLIENT_ID}).");
 
 //builder.Services.Configure<SyntheticIdOptions>(builder.Configuration.GetSection("SyntheticId"));
-//builder.Services.Configure<RateLimitOptions>(builder.Configuration.GetSection("RateLimiting"));
+
+
+////existe ya una forma donde se hace una inyección de dependencias de 
+//// una sección de en el appsetting de nombre "RateLimiting"
+////"RateLimiting": {
+////    "PerIdentityPerMinute": 300,
+////    "BurstPer10Seconds": 50
+////  }, analizar ver el tema de las opciones avanzadas, comente el servicio y el appsetting
+
+////builder.Services.Configure<RateLimitOptions>(builder.Configuration.GetSection("RateLimiting"));
 
 //builder.Services.AddDistributedMemoryCache(); // dev
 
@@ -211,6 +218,33 @@
 //    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
 //    {
 //        var user = ctx.User;
+
+
+//        //✅ Por token / client_id
+
+//        //Dónde: en tu GlobalLimiter(ya lo haces con appid / azp).
+//        //Mejor: usa azp/ appid para app-only, y oid para user; si existen ambos, decide “dimensión” separada(no mezclar).
+
+//        //✅ Por usuario
+
+//        //Dónde: en GlobalLimiter(ya con oid).
+//        //Mejor: siempre que sea delegated token, oid manda.
+
+//        //✅ Por endpoint(login/ exports / search)
+
+//        //Dónde: en AddRateLimiter() con AddPolicy() o AddFixedWindowLimiter("name"), y luego en cada endpoint:
+
+//        //.RequireRateLimiting("exports")
+
+//        //.RequireRateLimiting("login")
+
+//        //.RequireRateLimiting("search")
+
+//        //✅ Por tenant(multi-tenant)
+
+//        //Dónde: en GlobalLimiter o(mejor) como segundo limiter que se aplique a endpoints caros.
+
+//        //Tenant key: tid del token (delegated) o tenantId en claim de app-only (igual tid existe).
 
 //        var key =
 //            user.FindFirstValue("oid")
