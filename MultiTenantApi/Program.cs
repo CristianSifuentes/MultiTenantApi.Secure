@@ -656,90 +656,90 @@ app.MapGet("/export/call-records", async (
 // SEARCH — hardened: ABAC tenant scope + strict validation + cursor pagination
 // Threats: OWASP API4 (resource consumption), API1 (BOLA via cross-tenant), scraping/fuzzing
 // =====================================================
-//app.MapGet("/search", async (
-//    HttpContext http,
-//    [AsParameters] SearchQuery q,
-//    ClaimsPrincipal user,
-//    IRawDataService dataSvc,
-//    ISyntheticIdService synth) =>
-//{
-//    // ✅ ABAC: tenant scoping (deny-by-default)
-//    var tenant = TenantContextFactory.From(user);
-//    if (string.IsNullOrWhiteSpace(tenant.TenantId))
-//        return Results.Forbid();
+app.MapGet("search", async (
+    HttpContext http,
+    [AsParameters] SearchQuery q,
+    ClaimsPrincipal user,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth) =>
+{
+    // ✅ ABAC: tenant scoping (deny-by-default)
+    var tenant = TenantContextFactory.From(user);
+    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+        return Results.Forbid();
 
-//    // ✅ Validate BEFORE touching data layer (cheap rejection)
-//    var v = SearchQueryValidator.Validate(q);
-//    if (!v.ok)
-//    {
-//        // consistent error shape (do not leak details)
-//        return Results.BadRequest(new
-//        {
-//            error = "invalid_query",
-//            message = v.error
-//        });
-//    }
+    // ✅ Validate BEFORE touching data layer (cheap rejection)
+    var v = SearchQueryValidator.Validate(q);
+    if (!v.ok)
+    {
+        // consistent error shape (do not leak details)
+        return Results.BadRequest(new
+        {
+            error = "invalid_query",
+            message = v.error
+        });
+    }
 
-//    // ✅ Hard clamp (defense-in-depth)
-//    var take = Math.Clamp(q.Limit ?? 25, 1, 100);
+    // ✅ Hard clamp (defense-in-depth)
+    var take = Math.Clamp(q.Limit ?? 25, 1, 100);
 
-//    // ✅ ABAC enforcement at the data layer: pass tenantId
-//    var page = await dataSvc.SearchAsync(
-//        tenantId: tenant.TenantId,
-//        query: q.Query!,
-//        channels: q.Channels,
-//        fromUtc: q.FromUtc,
-//        toUtc: q.ToUtc,
-//        nextToken: q.NextPageToken,
-//        take: take,
-//        ct: http.RequestAborted);
+    // ✅ ABAC enforcement at the data layer: pass tenantId
+    var page = await dataSvc.SearchAsync(
+        tenantId: tenant.TenantId,
+        query: q.Query!,
+        channels: q.Channels,
+        fromUtc: q.FromUtc,
+        toUtc: q.ToUtc,
+        nextToken: q.NextPageToken,
+        take: take,
+        ct: http.RequestAborted);
 
-//    // ✅ Deny-by-default projection (never return domain raw object directly)
-//    // Only return "safe" fields + synthetic stable id
-//    var items = page.Items.Select(r =>
-//    {
-//        var shape = new Dictionary<string, object?>
-//        {
-//            ["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N")),
-//            ["createdAt"] = r.CreatedAt,
-//            ["channel"] = r.Channel,
-//            ["textPreview"] = SearchQueryValidator.SafePreview(r.Text, maxLen: 160)
-//        };
+    // ✅ Deny-by-default projection (never return domain raw object directly)
+    // Only return "safe" fields + synthetic stable id
+    var items = page.Items.Select(r =>
+    {
+        var shape = new Dictionary<string, object?>
+        {
+            ["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N")),
+            ["createdAt"] = r.CreatedAt,
+            ["channel"] = r.Channel,
+            ["textPreview"] = SearchQueryValidator.SafePreview(r.Text, maxLen: 160)
+        };
 
-//        // Optionally: expose a stable synthetic user id (avoid leaking real internal user ids)
-//        shape["syntheticUserId"] = string.IsNullOrWhiteSpace(r.UserInternalId)
-//            ? null
-//            : synth.Create("user", r.UserInternalId);
+        // Optionally: expose a stable synthetic user id (avoid leaking real internal user ids)
+        shape["syntheticUserId"] = string.IsNullOrWhiteSpace(r.UserInternalId)
+            ? null
+            : synth.Create("user", r.UserInternalId);
 
-//        return shape;
-//    });
+        return shape;
+    });
 
-//    return Results.Ok(new
-//    {
-//        tenantId = tenant.TenantId,
-//        query = new
-//        {
-//            q = q.Query,
-//            channels = q.Channels,
-//            fromUtc = q.FromUtc,
-//            toUtc = q.ToUtc,
-//            limit = take
-//        },
-//        items,
-//        page = new
-//        {
-//            nextPageToken = page.NextToken,
-//            count = page.Items.Count
-//        }
-//    });
-//})
-//.RequireRateLimiting("search-tenant")
-//.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName) // or create a Search policy
-//.Produces(StatusCodes.Status200OK)
-//.ProducesProblem(StatusCodes.Status401Unauthorized)
-//.ProducesProblem(StatusCodes.Status403Forbidden)
-//.ProducesProblem(StatusCodes.Status429TooManyRequests)
-//.WithOpenApi();
+    return Results.Ok(new
+    {
+        tenantId = tenant.TenantId,
+        query = new
+        {
+            q = q.Query,
+            channels = q.Channels,
+            fromUtc = q.FromUtc,
+            toUtc = q.ToUtc,
+            limit = take
+        },
+        items,
+        page = new
+        {
+            nextPageToken = page.NextToken,
+            count = page.Items.Count
+        }
+    });
+})
+.RequireRateLimiting("search-tenant")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName) // or create a Search policy
+.Produces(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status401Unauthorized)
+.ProducesProblem(StatusCodes.Status403Forbidden)
+.ProducesProblem(StatusCodes.Status429TooManyRequests)
+.WithOpenApi();
 
 
 app.MapGet("api/v1/call-records", async (

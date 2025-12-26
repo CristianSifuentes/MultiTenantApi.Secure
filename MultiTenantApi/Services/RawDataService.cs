@@ -14,7 +14,18 @@ public interface IRawDataService
           string? nextToken,
           int take,
           CancellationToken ct);
-    
+
+        Task<PageResult<RawRecord>> SearchAsync(
+        string tenantId,
+        string query,
+        string[]? channels,
+        DateTimeOffset? fromUtc,
+        DateTimeOffset? toUtc,
+        string? nextToken,
+        int take,
+        CancellationToken ct);
+
+
 }
 
 //before ABAC
@@ -126,4 +137,58 @@ public sealed class InMemoryRawDataService : IRawDataService
 
         return Task.FromResult(new PageResult<RawRecord>(page, next));
     }
+
+
+    public Task<PageResult<RawRecord>> SearchAsync(
+    string tenantId,
+    string query,
+    string[]? channels,
+    DateTimeOffset? fromUtc,
+    DateTimeOffset? toUtc,
+    string? nextToken,
+    int take,
+    CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(tenantId))
+            throw new ArgumentException("tenantId is required.", nameof(tenantId));
+
+        if (string.IsNullOrWhiteSpace(query))
+            throw new ArgumentException("query is required.", nameof(query));
+
+        // Cursor (demo offset)
+        var offset = 0;
+        if (!string.IsNullOrWhiteSpace(nextToken) &&
+            int.TryParse(nextToken, out var parsed) && parsed >= 0)
+        {
+            offset = parsed;
+        }
+
+        // ✅ ABAC boundary FIRST: tenant scope
+        IEnumerable<RawRecord> q = _data.Where(r => r.TenantId == tenantId);
+
+        // Optional channel filter (whitelisted by validator)
+        if (channels is { Length: > 0 })
+        {
+            var allowed = new HashSet<string>(channels, StringComparer.OrdinalIgnoreCase);
+            q = q.Where(r => allowed.Contains(r.Channel));
+        }
+
+        // Optional time bounding
+        if (fromUtc.HasValue) q = q.Where(r => r.CreatedAt >= fromUtc.Value);
+        if (toUtc.HasValue) q = q.Where(r => r.CreatedAt <= toUtc.Value);
+
+        // Search match (within tenant)
+        var term = query.Trim();
+        q = q.Where(r => r.Text.Contains(term, StringComparison.OrdinalIgnoreCase));
+
+        // Materialize once
+        var list = q as IList<RawRecord> ?? q.ToList();
+
+        var page = list.Skip(offset).Take(take).ToList();
+        var next = (offset + page.Count) < list.Count ? (offset + page.Count).ToString() : null;
+
+        return Task.FromResult(new PageResult<RawRecord>(page, next));
+    }
+
+
 }
