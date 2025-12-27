@@ -18,6 +18,7 @@ using MultiTenantApi.Models;
 using MultiTenantApi.Security;
 using MultiTenantApi.Security.IdempotencyStore;
 using MultiTenantApi.Services;
+using MultiTenantApi.Services.HMAC;
 using Serilog;
 using System;
 using System.ComponentModel;
@@ -431,6 +432,10 @@ builder.Services.AddSingleton<BlockSensitiveQueryStringMiddleware>();
 //5.3 Middleware Idempotency(solo para POST/PUT/PATCH)
 builder.Services.AddSingleton<IIdempotencyStore, DistributedIdempotencyStore>();
 builder.Services.AddSingleton<IdempotencyMiddleware>();
+
+//4) Implementación enterprise: Cursor firmado + contrato estándar
+builder.Services.AddSingleton<ICursorProtector, HmacCursorProtector>();
+
 
 #endregion
 
@@ -871,6 +876,93 @@ app.MapGet("api/v2/raw-records", async (
 .ProducesProblem(StatusCodes.Status429TooManyRequests)
 .WithOpenApi();
 
+app.MapGet("api/v3/raw-records", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    ICursorProtector cursorProtector,
+    ClaimsPrincipal user) =>
+{
+    var tenant = TenantContextFactory.From(user);
+    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+        return Results.Forbid();
+
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+    // ✅ Early rejection (cheap)
+    var v = RawQueryValidator.Validate(q.Filter, q.NextPageToken, take);
+    if (!v.ok)
+        return Results.BadRequest(new { error = "invalid_query", message = v.error });
+
+    // ✅ Unprotect cursor (if present)
+    PageCursor? cursor = null;
+    if (!string.IsNullOrWhiteSpace(q.NextPageToken))
+    {
+        if (!cursorProtector.TryUnprotect(q.NextPageToken!, out var c))
+            return Results.BadRequest(new { error = "invalid_cursor" });
+
+        // ✅ Bind to tenant
+        if (!string.Equals(c.TenantId, tenant.TenantId, StringComparison.Ordinal))
+            return Results.BadRequest(new { error = "cursor_tenant_mismatch" });
+
+        // ✅ Bind to filter
+        var expectedFilterHash = FilterHasher.Hash(q.Filter);
+        if (!string.Equals(c.FilterHash, expectedFilterHash, StringComparison.Ordinal))
+            return Results.BadRequest(new { error = "cursor_filter_mismatch" });
+
+        // ✅ Optional TTL
+        if (c.IssuedUtc < DateTimeOffset.UtcNow.AddMinutes(-30))
+            return Results.BadRequest(new { error = "cursor_expired" });
+
+        cursor = c;
+    }
+
+    // ✅ Ask data layer with cursor.LastKey (not raw token)
+    // Recomendación: cambia tu IRawDataService para aceptar "lastKey" en vez de token opaco.
+    var page = await dataSvc.QueryAsync(
+        tenant.TenantId,
+        q.Filter,
+        nextToken: cursor?.LastKey, // aquí
+        take,
+        http.RequestAborted);
+
+    var items = page.Items.Select(r =>
+    {
+        var shape = FieldProjector.ToApiShape(r, synth);
+        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+        return shape;
+    });
+
+    // ✅ Produce next signed cursor
+    string? nextToken = null;
+    if (!string.IsNullOrWhiteSpace(page.NextToken))
+    {
+        var nextCursor = new PageCursor(
+            TenantId: tenant.TenantId,
+            FilterHash: FilterHasher.Hash(q.Filter),
+            Sort: "createdAt:asc",
+            LastKey: page.NextToken, // lastKey from data layer
+            IssuedUtc: DateTimeOffset.UtcNow);
+
+        nextToken = cursorProtector.Protect(nextCursor);
+    }
+
+    return Results.Ok(new
+    {
+        items,
+        page = new
+        {
+            limit = take,
+            nextPageToken = nextToken,
+            count = page.Items.Count
+        }
+    });
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
 
 
 app.MapGet("api/v1/raw-records/ABAC", async (
@@ -1015,6 +1107,13 @@ app.MapPost("/api/v1/orders", async (
 
 
 app.Run();
+
+public sealed record PageCursor(
+    string TenantId,
+    string? FilterHash,
+    string Sort,          // e.g. "createdAt:asc"
+    string LastKey,       // e.g. last InternalId or createdAt+id
+    DateTimeOffset IssuedUtc);
 
 public sealed record CreateOrderRequest(string ProductId, int Quantity);
 public record RawQuery(string? Filter, int? Limit, string? NextPageToken);
