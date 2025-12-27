@@ -635,7 +635,9 @@ app.MapGet("api/v1/raw-records", async (
 .WithOpenApi();
 
 // =====================================================
-// Metadata export — inventory of exposed fields (OWASP API9)
+// Metadata export — inve
+//
+// ntory of exposed fields (OWASP API9)
 // =====================================================
 app.MapGet("api/v1/export/metadata/call-records", async (
     ICallRecordService svc,
@@ -984,8 +986,37 @@ app.MapPost("/security/revoke-token", async (
 .RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 .WithOpenApi();
 
+
+
+app.MapPost("/api/v1/orders", async (
+    ClaimsPrincipal user,
+    CreateOrderRequest req,
+    CancellationToken ct) =>
+{
+    // validate input (type/range/etc.)
+    if (string.IsNullOrWhiteSpace(req.ProductId) || req.ProductId.Length > 64)
+        return Results.BadRequest(new { error = "invalid_product" });
+
+    if (req.Quantity < 1 || req.Quantity > 100)
+        return Results.BadRequest(new { error = "invalid_quantity" });
+
+    // TODO: create order (DB) — must be deterministic per idempotency key
+    var orderId = Guid.NewGuid().ToString("N");
+
+    return Results.Created($"/api/v1/orders/{orderId}", new
+    {
+        id = orderId,
+        productId = req.ProductId,
+        quantity = req.Quantity
+    });
+})
+.RequireAuthorization()
+.WithOpenApi();
+
+
 app.Run();
 
+public sealed record CreateOrderRequest(string ProductId, int Quantity);
 public record RawQuery(string? Filter, int? Limit, string? NextPageToken);
 public sealed record SearchQuery(
     string? Query,
