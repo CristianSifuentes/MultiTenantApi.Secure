@@ -83,7 +83,7 @@ public sealed class InMemoryRawDataService : IRawDataService
     public InMemoryRawDataService()
     {
         // Demo multi-tenant dataset (ABAC-ready)
-        var tenants = new[] { "tenant-a", "tenant-b", "tenant-c" };
+        var tenants = new[] { "d6dd8f1b-8287-4fae-9828-d56b2a97df1e", "tenant-b", "tenant-c" };
 
         _data = Enumerable.Range(0, 25_000).Select(i => new RawRecord
         {
