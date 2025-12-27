@@ -19,6 +19,7 @@ using MultiTenantApi.Security;
 using MultiTenantApi.Security.IdempotencyStore;
 using MultiTenantApi.Services;
 using MultiTenantApi.Services.HMAC;
+using MultiTenantApi.Services.HttpCache;
 using Serilog;
 using System;
 using System.ComponentModel;
@@ -673,6 +674,42 @@ app.MapGet("api/v1/export/metadata/call-records", async (
 .ProducesProblem(StatusCodes.Status429TooManyRequests)
 .WithOpenApi();
 
+
+
+app.MapGet("api/v1/export/metadata/call-records", async (
+    HttpContext http,
+    ICallRecordService svc,
+    IMapper mapper,
+    CancellationToken ct,
+    ClaimsPrincipal user
+    ) =>
+{
+    var tid = user.FindFirstValue("tid") ?? "unknown";
+
+    var fields = ApiMetadataBuilder.BuildFor<CallRecord>();
+    var sampleDomain = await svc.GetSampleAsync(ct);
+    var sampleExport = mapper.Map<List<CallRecordExportDto>>(sampleDomain);
+
+    // ✅ ETag input MUST include tenant + version + a stable representation
+    var etagInput = $"tenant:{tid}|entity:CallRecord|v1|fields:{fields.Count}|sample:{sampleExport.Count}";
+    var etag = HttpCache.ComputeWeakETag(etagInput);
+
+    var response = new EntityMetadataResponse<CallRecordExportDto>(
+        EntityName: "CallRecord",
+        Version: "v1",
+        Fields: fields,
+        Sample: sampleExport);
+
+    return HttpCache.ETagOrOk(http, etag, response, maxAgeSeconds: 120);
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.Produces<EntityMetadataResponse<CallRecordExportDto>>(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status401Unauthorized)
+.ProducesProblem(StatusCodes.Status403Forbidden)
+.ProducesProblem(StatusCodes.Status429TooManyRequests)
+.WithOpenApi();
+
 // =====================================================
 // Call records export — safe DTO only
 // =====================================================
@@ -1104,6 +1141,18 @@ app.MapPost("/api/v1/orders", async (
 })
 .RequireAuthorization()
 .WithOpenApi();
+
+//Middleware setea X-Tenant-Id en response
+//Proxy define cache key por X-Tenant-Id + path + query
+app.Use(async (ctx, next) =>
+{
+    await next();
+
+    // Después de auth, si hay tid, lo reflejas
+    var tid = ctx.User.FindFirstValue("tid");
+    if (!string.IsNullOrWhiteSpace(tid))
+        ctx.Response.Headers["X-Tenant-Id"] = tid;
+});
 
 
 app.Run();
