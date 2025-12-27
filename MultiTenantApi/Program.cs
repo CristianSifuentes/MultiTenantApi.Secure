@@ -1,8 +1,10 @@
 using Mapster;
 using MapsterMapper;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Logging;
@@ -14,6 +16,7 @@ using MultiTenantApi.Mapping;
 using MultiTenantApi.Middleware;
 using MultiTenantApi.Models;
 using MultiTenantApi.Security;
+using MultiTenantApi.Security.IdempotencyStore;
 using MultiTenantApi.Services;
 using Serilog;
 using System;
@@ -423,7 +426,11 @@ builder.Services.AddSingleton<RequestLimitsMiddleware>();
 builder.Services.AddSingleton<WafSignalsMiddleware>();
 // 1) “Nunca secrets en URLs” — dónde se implementa y cómo
 builder.Services.AddSingleton<DenySecretsInUrlMiddleware>();
-
+//3) No meter secretos en querystring (se loguea en proxies)
+builder.Services.AddSingleton<BlockSensitiveQueryStringMiddleware>();
+//5.3 Middleware Idempotency(solo para POST/PUT/PATCH)
+builder.Services.AddSingleton<IIdempotencyStore, DistributedIdempotencyStore>();
+builder.Services.AddSingleton<IdempotencyMiddleware>();
 
 #endregion
 
@@ -473,6 +480,13 @@ app.UseMiddleware<WafSignalsMiddleware>();
 // 1) “Nunca secrets en URLs” — dónde se implementa y cómo
 app.UseMiddleware<DenySecretsInUrlMiddleware>();
 
+
+// 3) No meter secretos en querystring (se loguea en proxies)
+app.UseMiddleware<BlockSensitiveQueryStringMiddleware>();
+
+//5.3 Middleware Idempotency(solo para POST/PUT/PATCH)
+app.UseMiddleware<IdempotencyMiddleware>();
+
 #endregion
 
 
@@ -508,7 +522,7 @@ app.MapGet("/health", () => Results.Ok(new { status = "ok", utc = DateTimeOffset
    .AllowAnonymous()
    .WithOpenApi();
 
-app.MapGet("/whoami", (ClaimsPrincipal user) =>
+app.MapGet("api/v1/whoami", (ClaimsPrincipal user) =>
 {
     var tid = user.FindFirstValue("tid");
     var oid = user.FindFirstValue("oid");
@@ -536,7 +550,7 @@ app.MapGet("/whoami", (ClaimsPrincipal user) =>
 // =====================================================
 // Secure sample endpoints
 // =====================================================
-app.MapGet("/documents", (ClaimsPrincipal user) =>
+app.MapGet("api/v1/documents", (ClaimsPrincipal user) =>
 {
     var tid = user.FindFirstValue("tid");
     return Results.Ok(new
@@ -552,7 +566,7 @@ app.MapGet("/documents", (ClaimsPrincipal user) =>
 .RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
 .WithOpenApi();
 
-app.MapGet("/reports", (ClaimsPrincipal user) =>
+app.MapGet("api/v1/reports", (ClaimsPrincipal user) =>
 {
     var tid = user.FindFirstValue("tid");
     return Results.Ok(new
@@ -572,7 +586,7 @@ app.MapGet("/reports", (ClaimsPrincipal user) =>
 // =====================================================
 // RAW data export — hardened: rate limiting + safe field projection + synthetic IDs
 // =====================================================
-app.MapGet("/raw-data", async (
+app.MapGet("api/v1/raw-records", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
@@ -623,7 +637,7 @@ app.MapGet("/raw-data", async (
 // =====================================================
 // Metadata export — inventory of exposed fields (OWASP API9)
 // =====================================================
-app.MapGet("/export/metadata/call-records", async (
+app.MapGet("api/v1/export/metadata/call-records", async (
     ICallRecordService svc,
     IMapper mapper,
     CancellationToken ct,
@@ -655,7 +669,7 @@ app.MapGet("/export/metadata/call-records", async (
 // =====================================================
 // Call records export — safe DTO only
 // =====================================================
-app.MapGet("/export/call-records", async (
+app.MapGet("api/v1/export/call-records", async (
     ICallRecordService svc,
     IMapper mapper,
     ISyntheticIdService synth,
@@ -694,7 +708,7 @@ app.MapGet("/export/call-records", async (
 // SEARCH — hardened: ABAC tenant scope + strict validation + cursor pagination
 // Threats: OWASP API4 (resource consumption), API1 (BOLA via cross-tenant), scraping/fuzzing
 // =====================================================
-app.MapGet("search", async (
+app.MapGet("api/v1/search", async (
     HttpContext http,
     [AsParameters] SearchQuery q,
     ClaimsPrincipal user,
@@ -806,7 +820,7 @@ app.MapGet("api/v1/call-records", async (
 .WithOpenApi();
 
 
-app.MapGet("api/v1/raw-data", async (
+app.MapGet("api/v2/raw-records", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
@@ -857,7 +871,7 @@ app.MapGet("api/v1/raw-data", async (
 
 
 
-app.MapGet("api/v1/raw-data/ABAC", async (
+app.MapGet("api/v1/raw-records/ABAC", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
@@ -900,7 +914,7 @@ app.MapGet("api/v1/raw-data/ABAC", async (
 .WithOpenApi();
 
 
-app.MapGet("api/v1/raw-data/ABAC/early-rejection-cheap", async (
+app.MapGet("api/v1/raw-records/ABAC/early-rejection-cheap", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
