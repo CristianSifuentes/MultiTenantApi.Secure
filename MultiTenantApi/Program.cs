@@ -602,6 +602,8 @@ app.MapGet("api/v1/raw-records", async (
     var tenant = TenantContextFactory.From(user);
 
     // clamp limit to prevent resource abuse
+    // Quien implemente take usa limit cursor
+    // necesito volver a ver como fundiona el limit cursor
     var take = Math.Clamp(q.Limit ?? 100, 1, 100);
 
     //before
@@ -777,6 +779,7 @@ app.MapGet("api/v1/search", async (
     }
 
     // ✅ Hard clamp (defense-in-depth)
+    // Quien implemente take usa limit cursor
     var take = Math.Clamp(q.Limit ?? 25, 1, 100);
 
     // ✅ ABAC enforcement at the data layer: pass tenantId
@@ -1165,6 +1168,8 @@ public sealed record PageCursor(
     DateTimeOffset IssuedUtc);
 
 public sealed record CreateOrderRequest(string ProductId, int Quantity);
+
+// Quien implemente RawQuery usa limit cursor
 public record RawQuery(string? Filter, int? Limit, string? NextPageToken);
 public sealed record SearchQuery(
     string? Query,
