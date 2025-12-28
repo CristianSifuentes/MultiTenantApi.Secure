@@ -18,11 +18,13 @@ using MultiTenantApi.Models;
 using MultiTenantApi.Security;
 using MultiTenantApi.Security.IdempotencyStore;
 using MultiTenantApi.Services;
+using MultiTenantApi.Services.CacheService;
 using MultiTenantApi.Services.HMAC;
 using MultiTenantApi.Services.HttpCache;
 using Serilog;
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Threading.RateLimiting;
@@ -74,6 +76,11 @@ builder.Services.Configure<RateLimitingEnterpriseOptions>(
 // Esto NO reemplaza WAF, pero hace tu app resistente incluso si el WAF falla o está mal configurado. 
 builder.Services.Configure<RequestLimitsOptions>(builder.Configuration.GetSection("RequestLimits"));
 
+
+//✅ AddDistributedMemoryCache()(dev) → solo habilita una implementación de IDistributedCache en memoria, pero no la estás usando para cachear respuestas.
+//✅ Multi-tenant (claim tid) + ABAC → base perfecta para cache seguro por tenant.
+//✅ Rate limiting → complementa cache (estabilidad).
+//✅ AuditMiddleware → cuidado: cache + audit / logging deben coexistir sin filtrar tokens.
 
 
 builder.Services.AddDistributedMemoryCache(); // dev
@@ -437,6 +444,9 @@ builder.Services.AddSingleton<IdempotencyMiddleware>();
 //4) Implementación enterprise: Cursor firmado + contrato estándar
 builder.Services.AddSingleton<ICursorProtector, HmacCursorProtector>();
 
+// 3.2 Un CacheService pro con “GetOrCreateAsync”
+builder.Services.AddSingleton<IApiCache, ApiCache>();
+
 
 #endregion
 
@@ -678,7 +688,7 @@ app.MapGet("api/v1/export/metadata/call-records", async (
 
 
 
-app.MapGet("api/v1/export/metadata/call-records", async (
+app.MapGet("api/v2/export/metadata/call-records", async (
     HttpContext http,
     ICallRecordService svc,
     IMapper mapper,
@@ -711,6 +721,8 @@ app.MapGet("api/v1/export/metadata/call-records", async (
 .ProducesProblem(StatusCodes.Status403Forbidden)
 .ProducesProblem(StatusCodes.Status429TooManyRequests)
 .WithOpenApi();
+
+
 
 // =====================================================
 // Call records export — safe DTO only
@@ -998,6 +1010,71 @@ app.MapGet("api/v3/raw-records", async (
             count = page.Items.Count
         }
     });
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
+
+static string RawCacheKey(string tenantId, RawQuery q, int take)
+{
+    return $"raw:v1:tenant:{tenantId}:limit:{take}:filter:{q.Filter ?? ""}:cursor:{q.NextPageToken ?? ""}";
+}
+
+
+app.MapGet("api/v4/raw-records", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    IApiCache cache,
+    ClaimsPrincipal user) =>
+{
+    var tenant = TenantContextFactory.From(user);
+    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+        return Results.Forbid();
+
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+    // ✅ early rejection
+    var v = RawQueryValidator.Validate(q.Filter, q.NextPageToken, take);
+    if (!v.ok)
+        return Results.BadRequest(new { error = "invalid_query", message = v.error });
+
+    var cacheKey = RawCacheKey(tenant.TenantId, q, take);
+
+    // ✅ TTL corto: reduce load, limita staleness
+    var cached = await cache.GetOrCreateAsync(
+        cacheKey,
+        ttl: TimeSpan.FromSeconds(15),
+        factory: async ct =>
+        {
+            var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, ct);
+
+            var items = page.Items.Select(r =>
+            {
+                var shape = FieldProjector.ToApiShape(r, synth);
+                shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+                return shape;
+            });
+
+            return new
+            {
+                items,
+                page = new
+                {
+                    limit = take,
+                    nextPageToken = page.NextToken,
+                    count = page.Items.Count
+                }
+            };
+        },
+        ct: http.RequestAborted);
+
+    // ✅ ETag encima del server cache (doble beneficio)
+    var tid = tenant.TenantId;
+    var etag = HttpCache.ComputeWeakETag($"{tid}|{cacheKey}");
+    return HttpCache.ETagOrOk(http, etag, cached, maxAgeSeconds: 10);
 })
 .RequireRateLimiting("exports-tenant")
 .RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
