@@ -1,4 +1,5 @@
 using Mapster;
+using Mapster.Models;
 using MapsterMapper;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Http;
@@ -28,6 +29,7 @@ using Serilog;
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Threading.RateLimiting;
@@ -78,6 +80,9 @@ builder.Services.Configure<RateLimitingEnterpriseOptions>(
 
 // Esto NO reemplaza WAF, pero hace tu app resistente incluso si el WAF falla o está mal configurado. 
 builder.Services.Configure<RequestLimitsOptions>(builder.Configuration.GetSection("RequestLimits"));
+
+//3.2 Middleware global de deprecación por versión
+builder.Services.Configure<DeprecationPolicyOptions>(builder.Configuration.GetSection("DeprecationPolicy"));
 
 
 //✅ AddDistributedMemoryCache()(dev) → solo habilita una implementación de IDistributedCache en memoria, pero no la estás usando para cachear respuestas.
@@ -419,6 +424,8 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(o =>
 {
     o.SwaggerDoc("v1", new() { Title = "MultiTenantApi.Secure", Version = "v1" });
+    o.SwaggerDoc("v2", new() { Title = "MultiTenantApi.Secure", Version = "v2" });
+    o.SwaggerDoc("v3", new() { Title = "MultiTenantApi.Secure", Version = "v3" });
 
     o.AddSecurityDefinition("bearerAuth", new OpenApiSecurityScheme
     {
@@ -482,6 +489,14 @@ builder.Services.AddHostedService<ExportWorker>();
 //6) Auth failures: evita mensajes raros / inconsistentes
 builder.Services.AddSingleton<AuthProblemDetailsMiddleware>();
 
+//2) Opción B(enterprise interno): Versionado por Header
+builder.Services.AddSingleton<ApiVersioningMiddleware>();
+
+//3.2 Middleware global de deprecación por versión
+builder.Services.AddSingleton<DeprecationHeadersMiddleware>();
+
+//4) Observabilidad real: medir uso por versión + tenant + clientAppId
+builder.Services.AddSingleton<ApiVersionTelemetryMiddleware>();
 
 
 #endregion
@@ -493,6 +508,28 @@ builder.Services.AddSingleton<AuthProblemDetailsMiddleware>();
 // Pipeline hardening
 // =====================================================
 var app = builder.Build();
+
+// Aqui podemos manejar el versionado de apis
+var api = app.MapGroup("/api");
+
+
+var v1 = api.MapGroup("/v1")
+    .WithTags("v1")
+    .WithOpenApi();
+
+var v2 = api.MapGroup("/v2")
+    .WithTags("v2")
+    .WithOpenApi();
+
+var v3 = api.MapGroup("/v3")
+    .WithTags("v3")
+    .WithOpenApi();
+
+var v4 = api.MapGroup("/v4")
+    .WithTags("v4")
+    .WithOpenApi();
+
+
 
 // Behind reverse proxies (Azure, Nginx, APIM): trust forwarded headers
 app.UseForwardedHeaders(new ForwardedHeadersOptions
@@ -539,6 +576,13 @@ app.UseMiddleware<BlockSensitiveQueryStringMiddleware>();
 //5.3 Middleware Idempotency(solo para POST/PUT/PATCH)
 app.UseMiddleware<IdempotencyMiddleware>();
 
+//2) Opción B(enterprise interno): Versionado por Header
+app.UseMiddleware<ApiVersioningMiddleware>();
+
+//4) Observabilidad real: medir uso por versión + tenant + clientAppId
+app.UseMiddleware<ApiVersionTelemetryMiddleware>();
+
+
 #endregion
 
 
@@ -546,6 +590,8 @@ app.UseSwagger();
 app.UseSwaggerUI(c =>
 {
     c.SwaggerEndpoint("/swagger/v1/swagger.json", "MultiTenantApi.Secure v1");
+    c.SwaggerEndpoint("/swagger/v2/swagger.json", "MultiTenantApi.Secure v2");
+
 });
 
 app.UseRateLimiter();
@@ -608,14 +654,16 @@ app.MapGet("/error", (HttpContext ctx) =>
 //        extensions: new Dictionary<string, object?> { ["traceId"] = traceId });
 //}).ExcludeFromDescription();
 
+
+
 // =====================================================
 // Health / diagnostics
 // =====================================================
-app.MapGet("/health", () => Results.Ok(new { status = "ok", utc = DateTimeOffset.UtcNow }))
+v1.MapGet("/health", () => Results.Ok(new { status = "ok", utc = DateTimeOffset.UtcNow }))
    .AllowAnonymous()
    .WithOpenApi();
 
-app.MapGet("api/v1/whoami", (ClaimsPrincipal user) =>
+ v1.MapGet("/whoami", (ClaimsPrincipal user) =>
 {
     var tid = user.FindFirstValue("tid");
     var oid = user.FindFirstValue("oid");
@@ -643,7 +691,7 @@ app.MapGet("api/v1/whoami", (ClaimsPrincipal user) =>
 // =====================================================
 // Secure sample endpoints
 // =====================================================
-app.MapGet("api/v1/documents", (ClaimsPrincipal user) =>
+v1.MapGet("/documents", (ClaimsPrincipal user) =>
 {
     var tid = user.FindFirstValue("tid");
     return Results.Ok(new
@@ -659,7 +707,7 @@ app.MapGet("api/v1/documents", (ClaimsPrincipal user) =>
 .RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
 .WithOpenApi();
 
-app.MapGet("api/v1/reports", (ClaimsPrincipal user) =>
+v1.MapGet("/reports", (ClaimsPrincipal user) =>
 {
     var tid = user.FindFirstValue("tid");
     return Results.Ok(new
@@ -679,7 +727,7 @@ app.MapGet("api/v1/reports", (ClaimsPrincipal user) =>
 // =====================================================
 // RAW data export — hardened: rate limiting + safe field projection + synthetic IDs
 // =====================================================
-app.MapGet("api/v1/raw-records", async (
+ v1.MapGet("/raw-records", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
@@ -734,7 +782,7 @@ app.MapGet("api/v1/raw-records", async (
 //
 // ntory of exposed fields (OWASP API9)
 // =====================================================
-app.MapGet("api/v1/export/metadata/call-records", async (
+v1.MapGet("/export/metadata/call-records", async (
     ICallRecordService svc,
     IMapper mapper,
     CancellationToken ct,
@@ -764,86 +812,11 @@ app.MapGet("api/v1/export/metadata/call-records", async (
 .WithOpenApi();
 
 
-
-app.MapGet("api/v2/export/metadata/call-records", async (
-    HttpContext http,
-    ICallRecordService svc,
-    IMapper mapper,
-    CancellationToken ct,
-    ClaimsPrincipal user
-    ) =>
-{
-    var tid = user.FindFirstValue("tid") ?? "unknown";
-
-    var fields = ApiMetadataBuilder.BuildFor<CallRecord>();
-    var sampleDomain = await svc.GetSampleAsync(ct);
-    var sampleExport = mapper.Map<List<CallRecordExportDto>>(sampleDomain);
-
-    // ✅ ETag input MUST include tenant + version + a stable representation
-    var etagInput = $"tenant:{tid}|entity:CallRecord|v1|fields:{fields.Count}|sample:{sampleExport.Count}";
-    var etag = HttpCache.ComputeWeakETag(etagInput);
-
-    var response = new EntityMetadataResponse<CallRecordExportDto>(
-        EntityName: "CallRecord",
-        Version: "v1",
-        Fields: fields,
-        Sample: sampleExport);
-
-    return HttpCache.ETagOrOk(http, etag, response, maxAgeSeconds: 120);
-})
-.RequireRateLimiting("exports-tenant")
-.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-.Produces<EntityMetadataResponse<CallRecordExportDto>>(StatusCodes.Status200OK)
-.ProducesProblem(StatusCodes.Status401Unauthorized)
-.ProducesProblem(StatusCodes.Status403Forbidden)
-.ProducesProblem(StatusCodes.Status429TooManyRequests)
-.WithOpenApi();
-
-
-
-// =====================================================
-// Call records export — safe DTO only
-// =====================================================
-app.MapGet("api/v1/export/call-records", async (
-    ICallRecordService svc,
-    IMapper mapper,
-    ISyntheticIdService synth,
-    CancellationToken ct,
-    ClaimsPrincipal user) =>
-{
-    var records = await svc.GetSampleAsync(ct);
-    var dto = mapper.Map<List<CallRecordExportDto>>(records);
-    for (var i = 0; i < dto.Count; i++)
-    {
-        var src = records[i];
-        dto[i] = dto[i] with { SyntheticCallId = synth.Create("call", src.CallId, src.InteractionId.ToString()) };
-    }
-
-    return Results.Ok(new
-    {
-        items = dto,
-        count = dto.Count
-    });
-})
-.RequireRateLimiting("exports-tenant")
-.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-.WithOpenApi();
-
-
-
-//En tu caso con Entra, “login” vive fuera, pero aplica perfecto a:
-/// password - reset / request
-/// send - otp
-/// invite
-/// onboarding / start
-//(flujos sensibles OWASP API6)
-
-
 // =====================================================
 // SEARCH — hardened: ABAC tenant scope + strict validation + cursor pagination
 // Threats: OWASP API4 (resource consumption), API1 (BOLA via cross-tenant), scraping/fuzzing
 // =====================================================
-app.MapGet("api/v1/search", async (
+v1.MapGet("/search", async (
     HttpContext http,
     [AsParameters] SearchQuery q,
     ClaimsPrincipal user,
@@ -930,7 +903,9 @@ app.MapGet("api/v1/search", async (
 .WithOpenApi();
 
 
-app.MapGet("api/v1/call-records", async (
+
+
+v1.MapGet("/call-records", async (
     ICallRecordService svc,
     IMapper mapper,
     ISyntheticIdService synth,
@@ -956,7 +931,312 @@ app.MapGet("api/v1/call-records", async (
 .WithOpenApi();
 
 
-app.MapGet("api/v2/raw-records", async (
+v1.MapGet("/raw-records/ABAC", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    ClaimsPrincipal user) =>
+{
+    var tenantId = user.FindFirstValue("tid");
+    if (string.IsNullOrWhiteSpace(tenantId))
+        return Results.Forbid(); // or 401/403 per your preference
+
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+    var page = await dataSvc.QueryAsync(
+        tenantId,
+        q.Filter,
+        q.NextPageToken,
+        take,
+        http.RequestAborted);
+
+    var items = page.Items.Select(r =>
+    {
+        var shape = FieldProjector.ToApiShape(r, synth);
+        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+        return shape;
+    });
+
+    return Results.Ok(new
+    {
+        items,
+        page = new
+        {
+            limit = take,
+            nextPageToken = page.NextToken,
+            count = page.Items.Count
+        }
+    });
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
+.WithOpenApi();
+
+
+v1.MapPost("/orders", async (
+    ClaimsPrincipal user,
+    CreateOrderRequest req,
+    CancellationToken ct) =>
+{
+    // validate input (type/range/etc.)
+    if (string.IsNullOrWhiteSpace(req.ProductId) || req.ProductId.Length > 64)
+        return Results.BadRequest(new { error = "invalid_product" });
+
+    if (req.Quantity < 1 || req.Quantity > 100)
+        return Results.BadRequest(new { error = "invalid_quantity" });
+
+    // TODO: create order (DB) — must be deterministic per idempotency key
+    var orderId = Guid.NewGuid().ToString("N");
+
+    return Results.Created($"/api/v1/orders/{orderId}", new
+    {
+        id = orderId,
+        productId = req.ProductId,
+        quantity = req.Quantity
+    });
+})
+.RequireAuthorization()
+.WithOpenApi();
+
+
+v1.MapPost("/exports/raw-records", async (
+    HttpContext http,
+    StartExportRequest body,
+    IJobQueue queue,
+    IJobStore store,
+    ClaimsPrincipal user) =>
+{
+    var tenant = TenantContextFactory.From(user);
+    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+        return Results.Forbid();
+
+    // ✅ Validación barata ANTES del job (rechazo temprano)
+    var take = Math.Clamp(body.Limit ?? 100, 1, 1000);
+    var v = RawQueryValidator.Validate(body.Filter, body.NextPageToken, take);
+    if (!v.ok)
+        return Results.BadRequest(new { error = "invalid_query", message = v.error });
+
+    var jobId = Guid.NewGuid().ToString("N");
+    var ttl = TimeSpan.FromHours(2);
+
+    var job = new JobInfo(
+        JobId: jobId,
+        TenantId: tenant.TenantId,
+        Kind: "export:raw-data",
+        State: JobState.Queued,
+        CreatedUtc: DateTimeOffset.UtcNow,
+        StartedUtc: null,
+        CompletedUtc: null,
+        ResultLocation: null,
+        Error: null);
+
+    await store.SetAsync(job, ttl, http.RequestAborted);
+
+    await queue.EnqueueAsync(
+        new JobMessage(jobId, tenant.TenantId, job.Kind, body, user),
+        http.RequestAborted);
+
+    // ✅ 202 Accepted con Location (status)
+    var statusUrl = $"/jobs/{jobId}";
+    var resultUrl = $"/exports/raw-data/{jobId}";
+
+    http.Response.Headers.Location = statusUrl;
+    return Results.Accepted(statusUrl, new StartJobResponse(jobId, statusUrl, resultUrl));
+})
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.RequireRateLimiting("exports-tenant")
+.WithOpenApi();
+
+
+v1.MapGet("/jobs/{id}", async (
+    string id,
+    HttpContext http,
+    IJobStore store,
+    ClaimsPrincipal user) =>
+{
+    var tenantId = user.FindFirstValue("tid");
+    if (string.IsNullOrWhiteSpace(tenantId)) return Results.Forbid();
+
+    var job = await store.GetAsync(id, http.RequestAborted);
+    if (job is null) return Results.NotFound();
+
+    // ✅ ABAC: el job pertenece al tenant
+    if (!string.Equals(job.TenantId, tenantId, StringComparison.Ordinal))
+        return Results.Forbid();
+
+    return Results.Ok(job);
+})
+.RequireAuthorization()
+.WithOpenApi();
+
+v1.MapGet("/exports/raw-data/{jobId}", async (
+    string jobId,
+    HttpContext http,
+    IJobStore store,
+    ClaimsPrincipal user) =>
+{
+    var tenantId = user.FindFirstValue("tid");
+    if (string.IsNullOrWhiteSpace(tenantId)) return Results.Forbid();
+
+    var job = await store.GetAsync(jobId, http.RequestAborted);
+    if (job is null) return Results.NotFound();
+
+    if (!string.Equals(job.TenantId, tenantId, StringComparison.Ordinal))
+        return Results.Forbid();
+
+    if (job.State is JobState.Queued or JobState.Running)
+        return Results.Accepted($"/jobs/{jobId}", new { status = job.State.ToString() });
+
+    if (job.State == JobState.Failed)
+        return Results.Problem(title: "Export failed", detail: job.Error, statusCode: 500);
+
+    if (job.State == JobState.Canceled)
+        return Results.Problem(title: "Export canceled", statusCode: 409);
+
+    // ✅ Succeeded: en prod, stream desde blob:
+    // return Results.File(stream, "application/json", "export.json");
+    return Results.Ok(new { message = "Would download from storage", job.ResultLocation });
+})
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
+
+
+v1.MapGet("/raw-records/ABAC/early-rejection-cheap", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    ClaimsPrincipal user) =>
+{
+    var tenantId = user.FindFirstValue("tid");
+    if (string.IsNullOrWhiteSpace(tenantId))
+        return Results.Forbid(); // or 401/403 per your preference
+
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+    // ✅ validate before hitting data layer
+    var v = RawQueryValidator.Validate(q.Filter, q.NextPageToken, take);
+    if (!v.ok)
+    {
+        return Results.BadRequest(new
+        {
+            error = "invalid_query",
+            message = v.error
+        });
+    }
+
+    var page = await dataSvc.QueryAsync(
+        tenantId,
+        q.Filter,
+        q.NextPageToken,
+        take,
+        http.RequestAborted);
+
+    var items = page.Items.Select(r =>
+    {
+        var shape = FieldProjector.ToApiShape(r, synth);
+        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+        return shape;
+    });
+
+    return Results.Ok(new
+    {
+        items,
+        page = new
+        {
+            limit = take,
+            nextPageToken = page.NextToken,
+            count = page.Items.Count
+        }
+    });
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
+.WithOpenApi();
+
+v1.MapPost("/security/revoke-token", async (
+    string jti,
+    ITokenRevocationStore store,
+    IOptions<TokenHardeningOptions> opt,
+    CancellationToken ct) =>
+{
+    // Revoke for the max age window (+ skew)
+    var ttl = TimeSpan.FromMinutes(opt.Value.MaxAccessTokenAgeMinutes + 5);
+    await store.RevokeAsync(jti, ttl, ct);
+    return Results.Ok(new { revoked = true, jti, ttlMinutes = ttl.TotalMinutes });
+})
+//.RequireAuthorization("AdminOnly")//
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
+
+#region endpoints v2
+v2.MapGet("/export/metadata/call-records", async (
+    HttpContext http,
+    ICallRecordService svc,
+    IMapper mapper,
+    CancellationToken ct,
+    ClaimsPrincipal user
+    ) =>
+{
+    var tid = user.FindFirstValue("tid") ?? "unknown";
+
+    var fields = ApiMetadataBuilder.BuildFor<CallRecord>();
+    var sampleDomain = await svc.GetSampleAsync(ct);
+    var sampleExport = mapper.Map<List<CallRecordExportDto>>(sampleDomain);
+
+    // ✅ ETag input MUST include tenant + version + a stable representation
+    var etagInput = $"tenant:{tid}|entity:CallRecord|v1|fields:{fields.Count}|sample:{sampleExport.Count}";
+    var etag = HttpCache.ComputeWeakETag(etagInput);
+
+    var response = new EntityMetadataResponse<CallRecordExportDto>(
+        EntityName: "CallRecord",
+        Version: "v1",
+        Fields: fields,
+        Sample: sampleExport);
+
+    return HttpCache.ETagOrOk(http, etag, response, maxAgeSeconds: 120);
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.Produces<EntityMetadataResponse<CallRecordExportDto>>(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status401Unauthorized)
+.ProducesProblem(StatusCodes.Status403Forbidden)
+.ProducesProblem(StatusCodes.Status429TooManyRequests)
+.WithOpenApi();
+
+
+// =====================================================
+// Call records export — safe DTO only
+// =====================================================
+v2.MapGet("/export/call-records", async (
+    ICallRecordService svc,
+    IMapper mapper,
+    ISyntheticIdService synth,
+    CancellationToken ct,
+    ClaimsPrincipal user) =>
+{
+    var records = await svc.GetSampleAsync(ct);
+    var dto = mapper.Map<List<CallRecordExportDto>>(records);
+    for (var i = 0; i < dto.Count; i++)
+    {
+        var src = records[i];
+        dto[i] = dto[i] with { SyntheticCallId = synth.Create("call", src.CallId, src.InteractionId.ToString()) };
+    }
+
+    return Results.Ok(new
+    {
+        items = dto,
+        count = dto.Count
+    });
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
+v2.MapGet("/raw-records", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
@@ -1005,7 +1285,11 @@ app.MapGet("api/v2/raw-records", async (
 .ProducesProblem(StatusCodes.Status429TooManyRequests)
 .WithOpenApi();
 
-app.MapGet("api/v3/raw-records", async (
+
+#endregion
+
+#region endpoints v3
+v3.MapGet("/raw-records", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
@@ -1101,14 +1385,11 @@ app.MapGet("api/v3/raw-records", async (
 .RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 .WithOpenApi();
 
+#endregion
 
-static string RawCacheKey(string tenantId, RawQuery q, int take)
-{
-    return $"raw:v1:tenant:{tenantId}:limit:{take}:filter:{q.Filter ?? ""}:cursor:{q.NextPageToken ?? ""}";
-}
+#region endpoints v4
 
-
-app.MapGet("api/v4/raw-records", async (
+v4.MapGet("api/v4/raw-records", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
@@ -1165,250 +1446,35 @@ app.MapGet("api/v4/raw-records", async (
 .RequireRateLimiting("exports-tenant")
 .RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 .WithOpenApi();
+#endregion
 
 
 
-app.MapGet("api/v1/raw-records/ABAC", async (
-    HttpContext http,
-    [AsParameters] RawQuery q,
-    IRawDataService dataSvc,
-    ISyntheticIdService synth,
-    ClaimsPrincipal user) =>
+//En tu caso con Entra, “login” vive fuera, pero aplica perfecto a:
+/// password - reset / request
+/// send - otp
+/// invite
+/// onboarding / start
+//(flujos sensibles OWASP API6)
+
+
+
+
+
+
+
+
+
+static string RawCacheKey(string tenantId, RawQuery q, int take)
 {
-    var tenantId = user.FindFirstValue("tid");
-    if (string.IsNullOrWhiteSpace(tenantId))
-        return Results.Forbid(); // or 401/403 per your preference
-
-    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
-
-    var page = await dataSvc.QueryAsync(
-        tenantId,
-        q.Filter,
-        q.NextPageToken,
-        take,
-        http.RequestAborted);
-
-    var items = page.Items.Select(r =>
-    {
-        var shape = FieldProjector.ToApiShape(r, synth);
-        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
-        return shape;
-    });
-
-    return Results.Ok(new
-    {
-        items,
-        page = new
-        {
-            limit = take,
-            nextPageToken = page.NextToken,
-            count = page.Items.Count
-        }
-    });
-})
-.RequireRateLimiting("exports-tenant")
-.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
-.WithOpenApi();
-
-
-app.MapGet("api/v1/raw-records/ABAC/early-rejection-cheap", async (
-    HttpContext http,
-    [AsParameters] RawQuery q,
-    IRawDataService dataSvc,
-    ISyntheticIdService synth,
-    ClaimsPrincipal user) =>
-{
-    var tenantId = user.FindFirstValue("tid");
-    if (string.IsNullOrWhiteSpace(tenantId))
-        return Results.Forbid(); // or 401/403 per your preference
-
-    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
-
-    // ✅ validate before hitting data layer
-    var v = RawQueryValidator.Validate(q.Filter, q.NextPageToken, take);
-    if (!v.ok)
-    {
-        return Results.BadRequest(new
-        {
-            error = "invalid_query",
-            message = v.error
-        });
-    }
-
-    var page = await dataSvc.QueryAsync(
-        tenantId,
-        q.Filter,
-        q.NextPageToken,
-        take,
-        http.RequestAborted);
-
-    var items = page.Items.Select(r =>
-    {
-        var shape = FieldProjector.ToApiShape(r, synth);
-        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
-        return shape;
-    });
-
-    return Results.Ok(new
-    {
-        items,
-        page = new
-        {
-            limit = take,
-            nextPageToken = page.NextToken,
-            count = page.Items.Count
-        }
-    });
-})
-.RequireRateLimiting("exports-tenant")
-.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
-.WithOpenApi();
+    return $"raw:v1:tenant:{tenantId}:limit:{take}:filter:{q.Filter ?? ""}:cursor:{q.NextPageToken ?? ""}";
+}
 
 
 
-app.MapPost("/security/revoke-token", async (
-    string jti,
-    ITokenRevocationStore store,
-    IOptions<TokenHardeningOptions> opt,
-    CancellationToken ct) =>
-{
-    // Revoke for the max age window (+ skew)
-    var ttl = TimeSpan.FromMinutes(opt.Value.MaxAccessTokenAgeMinutes + 5);
-    await store.RevokeAsync(jti, ttl, ct);
-    return Results.Ok(new { revoked = true, jti, ttlMinutes = ttl.TotalMinutes });
-})
-//.RequireAuthorization("AdminOnly")//
-.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-.WithOpenApi();
 
 
 
-app.MapPost("/api/v1/orders", async (
-    ClaimsPrincipal user,
-    CreateOrderRequest req,
-    CancellationToken ct) =>
-{
-    // validate input (type/range/etc.)
-    if (string.IsNullOrWhiteSpace(req.ProductId) || req.ProductId.Length > 64)
-        return Results.BadRequest(new { error = "invalid_product" });
-
-    if (req.Quantity < 1 || req.Quantity > 100)
-        return Results.BadRequest(new { error = "invalid_quantity" });
-
-    // TODO: create order (DB) — must be deterministic per idempotency key
-    var orderId = Guid.NewGuid().ToString("N");
-
-    return Results.Created($"/api/v1/orders/{orderId}", new
-    {
-        id = orderId,
-        productId = req.ProductId,
-        quantity = req.Quantity
-    });
-})
-.RequireAuthorization()
-.WithOpenApi();
-
-
-app.MapPost("api/v1/exports/raw-records", async (
-    HttpContext http,
-    StartExportRequest body,
-    IJobQueue queue,
-    IJobStore store,
-    ClaimsPrincipal user) =>
-{
-    var tenant = TenantContextFactory.From(user);
-    if (string.IsNullOrWhiteSpace(tenant.TenantId))
-        return Results.Forbid();
-
-    // ✅ Validación barata ANTES del job (rechazo temprano)
-    var take = Math.Clamp(body.Limit ?? 100, 1, 1000);
-    var v = RawQueryValidator.Validate(body.Filter, body.NextPageToken, take);
-    if (!v.ok)
-        return Results.BadRequest(new { error = "invalid_query", message = v.error });
-
-    var jobId = Guid.NewGuid().ToString("N");
-    var ttl = TimeSpan.FromHours(2);
-
-    var job = new JobInfo(
-        JobId: jobId,
-        TenantId: tenant.TenantId,
-        Kind: "export:raw-data",
-        State: JobState.Queued,
-        CreatedUtc: DateTimeOffset.UtcNow,
-        StartedUtc: null,
-        CompletedUtc: null,
-        ResultLocation: null,
-        Error: null);
-
-    await store.SetAsync(job, ttl, http.RequestAborted);
-
-    await queue.EnqueueAsync(
-        new JobMessage(jobId, tenant.TenantId, job.Kind, body, user),
-        http.RequestAborted);
-
-    // ✅ 202 Accepted con Location (status)
-    var statusUrl = $"/jobs/{jobId}";
-    var resultUrl = $"/exports/raw-data/{jobId}";
-
-    http.Response.Headers.Location = statusUrl;
-    return Results.Accepted(statusUrl, new StartJobResponse(jobId, statusUrl, resultUrl));
-})
-.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-.RequireRateLimiting("exports-tenant")
-.WithOpenApi();
-
-
-app.MapGet("api/v1/jobs/{id}", async (
-    string id,
-    HttpContext http,
-    IJobStore store,
-    ClaimsPrincipal user) =>
-{
-    var tenantId = user.FindFirstValue("tid");
-    if (string.IsNullOrWhiteSpace(tenantId)) return Results.Forbid();
-
-    var job = await store.GetAsync(id, http.RequestAborted);
-    if (job is null) return Results.NotFound();
-
-    // ✅ ABAC: el job pertenece al tenant
-    if (!string.Equals(job.TenantId, tenantId, StringComparison.Ordinal))
-        return Results.Forbid();
-
-    return Results.Ok(job);
-})
-.RequireAuthorization()
-.WithOpenApi();
-
-app.MapGet("api/v1/exports/raw-data/{jobId}", async (
-    string jobId,
-    HttpContext http,
-    IJobStore store,
-    ClaimsPrincipal user) =>
-{
-    var tenantId = user.FindFirstValue("tid");
-    if (string.IsNullOrWhiteSpace(tenantId)) return Results.Forbid();
-
-    var job = await store.GetAsync(jobId, http.RequestAborted);
-    if (job is null) return Results.NotFound();
-
-    if (!string.Equals(job.TenantId, tenantId, StringComparison.Ordinal))
-        return Results.Forbid();
-
-    if (job.State is JobState.Queued or JobState.Running)
-        return Results.Accepted($"/jobs/{jobId}", new { status = job.State.ToString() });
-
-    if (job.State == JobState.Failed)
-        return Results.Problem(title: "Export failed", detail: job.Error, statusCode: 500);
-
-    if (job.State == JobState.Canceled)
-        return Results.Problem(title: "Export canceled", statusCode: 409);
-
-    // ✅ Succeeded: en prod, stream desde blob:
-    // return Results.File(stream, "application/json", "export.json");
-    return Results.Ok(new { message = "Would download from storage", job.ResultLocation });
-})
-.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-.WithOpenApi();
 
 
 //Middleware setea X-Tenant-Id en response
