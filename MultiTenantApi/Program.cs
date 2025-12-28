@@ -18,6 +18,7 @@ using MultiTenantApi.Middleware;
 using MultiTenantApi.Models;
 using MultiTenantApi.Security;
 using MultiTenantApi.Security.IdempotencyStore;
+using MultiTenantApi.Security.ProblemDetails;
 using MultiTenantApi.Services;
 using MultiTenantApi.Services.CacheService;
 using MultiTenantApi.Services.HMAC;
@@ -231,6 +232,29 @@ builder.Services.AddRateLimiter(o =>
     //La idea: para exports/ search aplicas tres limiters en paralelo(tenant + client + user).
     //¿Que es GetChainedLimiter?
     o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    o.OnRejected = async (context, ct) =>
+    {
+        var http = context.HttpContext;
+
+        // Respuesta RFC7807 consistente
+        http.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        http.Response.ContentType = "application/problem+json";
+
+        var result = Results.Problem(
+            title: "Too many requests.",
+            statusCode: StatusCodes.Status429TooManyRequests,
+            detail: "Slow down and retry later.",
+            extensions: new Dictionary<string, object?>
+            {
+                ["errorCode"] = ApiErrorCodes.RateLimited,
+                ["traceId"] = http.TraceIdentifier,
+                ["correlationId"] = http.Items.TryGetValue("correlation_id", out var cid) ? cid : null
+            });
+
+        await result.ExecuteAsync(http);
+    };
+
 
     // 1) GLOBAL: user/client/ip (general anti-abuse)
     o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
@@ -455,6 +479,10 @@ builder.Services.AddSingleton<IJobQueue, InMemoryJobQueue>();
 builder.Services.AddSingleton<IJobStore, DistributedJobStore>();
 builder.Services.AddHostedService<ExportWorker>();
 
+//6) Auth failures: evita mensajes raros / inconsistentes
+builder.Services.AddSingleton<AuthProblemDetailsMiddleware>();
+
+
 
 #endregion
 
@@ -525,19 +553,60 @@ app.UseAuthentication();
 // recommended: AFTER UseAuthentication so ctx.User is populated.
 app.UseMiddleware<TokenAgeGuardMiddleware>();
 app.UseAuthorization();
+//6) Auth failures: evita mensajes raros / inconsistentes
+app.UseMiddleware<AuthProblemDetailsMiddleware>();
+
+app.UseSerilogRequestLogging(opts =>
+{
+    opts.EnrichDiagnosticContext = (diag, http) =>
+    {
+        diag.Set("TraceId", http.TraceIdentifier);
+
+        if (http.Items.TryGetValue("correlation_id", out var cid))
+            diag.Set("CorrelationId", cid);
+
+        var tid = http.User?.FindFirstValue("tid");
+        if (!string.IsNullOrWhiteSpace(tid)) diag.Set("TenantId", tid);
+
+        var azp = http.User?.FindFirstValue("azp") ?? http.User?.FindFirstValue("appid");
+        if (!string.IsNullOrWhiteSpace(azp)) diag.Set("ClientAppId", azp);
+
+        diag.Set("Path", http.Request.Path.Value);
+        diag.Set("Method", http.Request.Method);
+    };
+
+    // Opcional: baja ruido de health
+    opts.GetLevel = (ctx, _, ex) =>
+        ctx.Request.Path.StartsWithSegments("/health") ? Serilog.Events.LogEventLevel.Verbose :
+        ex is not null ? Serilog.Events.LogEventLevel.Error :
+        Serilog.Events.LogEventLevel.Information;
+});
 
 // =====================================================
 // Error endpoint (ProblemDetails)
 // =====================================================
 app.MapGet("/error", (HttpContext ctx) =>
 {
-    // RFC7807 ProblemDetails
-    var traceId = ctx.TraceIdentifier;
-    return Results.Problem(
+    // No stack traces, no exception details to clients.
+    // The exception is accessible via IExceptionHandlerFeature if you need it for logging only.
+
+    return Problem.Create(
+        ctx,
+        status: StatusCodes.Status500InternalServerError,
+        code: ApiErrorCodes.Unexpected,
         title: "An unexpected error occurred.",
-        statusCode: StatusCodes.Status500InternalServerError,
-        extensions: new Dictionary<string, object?> { ["traceId"] = traceId });
-}).ExcludeFromDescription();
+        detail: "Contact support with the correlationId if the issue persists.");
+})
+.ExcludeFromDescription();
+//app.MapGet("/error", (HttpContext ctx) =>
+//{
+//    // RFC7807 ProblemDetails
+//    var traceId = ctx.TraceIdentifier;
+//    return Results.Problem(
+//        title: "An unexpected error occurred.",
+//        statusCode: StatusCodes.Status500InternalServerError,
+//        extensions: new Dictionary<string, object?> { ["traceId"] = traceId });
+//}).ExcludeFromDescription();
 
 // =====================================================
 // Health / diagnostics
@@ -953,7 +1022,16 @@ app.MapGet("api/v3/raw-records", async (
     // ✅ Early rejection (cheap)
     var v = RawQueryValidator.Validate(q.Filter, q.NextPageToken, take);
     if (!v.ok)
-        return Results.BadRequest(new { error = "invalid_query", message = v.error });
+    {
+        return Problem.Create(
+            http,
+            status: StatusCodes.Status400BadRequest,
+            code: ApiErrorCodes.InvalidRequest,
+            title: "Invalid query.",
+            detail: v.error);
+    }
+    //if (!v.ok)
+    //    return Results.BadRequest(new { error = "invalid_query", message = v.error });
 
     // ✅ Unprotect cursor (if present)
     PageCursor? cursor = null;
