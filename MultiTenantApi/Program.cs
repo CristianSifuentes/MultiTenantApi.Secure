@@ -10,6 +10,7 @@ using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Logging;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+using Microsoft.Win32;
 using MultiTenantApi.Common;
 using MultiTenantApi.Infrastructure; // JsonWebToken (faster parser)
 using MultiTenantApi.Mapping;
@@ -21,6 +22,7 @@ using MultiTenantApi.Services;
 using MultiTenantApi.Services.CacheService;
 using MultiTenantApi.Services.HMAC;
 using MultiTenantApi.Services.HttpCache;
+using MultiTenantApi.Services.JobStore;
 using Serilog;
 using System;
 using System.ComponentModel;
@@ -446,6 +448,12 @@ builder.Services.AddSingleton<ICursorProtector, HmacCursorProtector>();
 
 // 3.2 Un CacheService pro con “GetOrCreateAsync”
 builder.Services.AddSingleton<IApiCache, ApiCache>();
+
+//4) Registrar DI en TU Program.cs (dónde ponerlo)
+//En tu bloque de “Mapster + Services (exports)” agrega:
+builder.Services.AddSingleton<IJobQueue, InMemoryJobQueue>();
+builder.Services.AddSingleton<IJobStore, DistributedJobStore>();
+builder.Services.AddHostedService<ExportWorker>();
 
 
 #endregion
@@ -1222,16 +1230,134 @@ app.MapPost("/api/v1/orders", async (
 .RequireAuthorization()
 .WithOpenApi();
 
+
+app.MapPost("api/v1/exports/raw-records", async (
+    HttpContext http,
+    StartExportRequest body,
+    IJobQueue queue,
+    IJobStore store,
+    ClaimsPrincipal user) =>
+{
+    var tenant = TenantContextFactory.From(user);
+    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+        return Results.Forbid();
+
+    // ✅ Validación barata ANTES del job (rechazo temprano)
+    var take = Math.Clamp(body.Limit ?? 100, 1, 1000);
+    var v = RawQueryValidator.Validate(body.Filter, body.NextPageToken, take);
+    if (!v.ok)
+        return Results.BadRequest(new { error = "invalid_query", message = v.error });
+
+    var jobId = Guid.NewGuid().ToString("N");
+    var ttl = TimeSpan.FromHours(2);
+
+    var job = new JobInfo(
+        JobId: jobId,
+        TenantId: tenant.TenantId,
+        Kind: "export:raw-data",
+        State: JobState.Queued,
+        CreatedUtc: DateTimeOffset.UtcNow,
+        StartedUtc: null,
+        CompletedUtc: null,
+        ResultLocation: null,
+        Error: null);
+
+    await store.SetAsync(job, ttl, http.RequestAborted);
+
+    await queue.EnqueueAsync(
+        new JobMessage(jobId, tenant.TenantId, job.Kind, body, user),
+        http.RequestAborted);
+
+    // ✅ 202 Accepted con Location (status)
+    var statusUrl = $"/jobs/{jobId}";
+    var resultUrl = $"/exports/raw-data/{jobId}";
+
+    http.Response.Headers.Location = statusUrl;
+    return Results.Accepted(statusUrl, new StartJobResponse(jobId, statusUrl, resultUrl));
+})
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.RequireRateLimiting("exports-tenant")
+.WithOpenApi();
+
+
+app.MapGet("api/v1/jobs/{id}", async (
+    string id,
+    HttpContext http,
+    IJobStore store,
+    ClaimsPrincipal user) =>
+{
+    var tenantId = user.FindFirstValue("tid");
+    if (string.IsNullOrWhiteSpace(tenantId)) return Results.Forbid();
+
+    var job = await store.GetAsync(id, http.RequestAborted);
+    if (job is null) return Results.NotFound();
+
+    // ✅ ABAC: el job pertenece al tenant
+    if (!string.Equals(job.TenantId, tenantId, StringComparison.Ordinal))
+        return Results.Forbid();
+
+    return Results.Ok(job);
+})
+.RequireAuthorization()
+.WithOpenApi();
+
+app.MapGet("api/v1/exports/raw-data/{jobId}", async (
+    string jobId,
+    HttpContext http,
+    IJobStore store,
+    ClaimsPrincipal user) =>
+{
+    var tenantId = user.FindFirstValue("tid");
+    if (string.IsNullOrWhiteSpace(tenantId)) return Results.Forbid();
+
+    var job = await store.GetAsync(jobId, http.RequestAborted);
+    if (job is null) return Results.NotFound();
+
+    if (!string.Equals(job.TenantId, tenantId, StringComparison.Ordinal))
+        return Results.Forbid();
+
+    if (job.State is JobState.Queued or JobState.Running)
+        return Results.Accepted($"/jobs/{jobId}", new { status = job.State.ToString() });
+
+    if (job.State == JobState.Failed)
+        return Results.Problem(title: "Export failed", detail: job.Error, statusCode: 500);
+
+    if (job.State == JobState.Canceled)
+        return Results.Problem(title: "Export canceled", statusCode: 409);
+
+    // ✅ Succeeded: en prod, stream desde blob:
+    // return Results.File(stream, "application/json", "export.json");
+    return Results.Ok(new { message = "Would download from storage", job.ResultLocation });
+})
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.WithOpenApi();
+
+
 //Middleware setea X-Tenant-Id en response
 //Proxy define cache key por X-Tenant-Id + path + query
+//app.Use(async (ctx, next) =>
+//{
+//    await next();
+
+//    // Después de auth, si hay tid, lo reflejas
+//    var tid = ctx.User.FindFirstValue("tid");
+//    if (!string.IsNullOrWhiteSpace(tid))
+//        ctx.Response.Headers["X-Tenant-Id"] = tid;
+//});
+
 app.Use(async (ctx, next) =>
 {
-    await next();
+    // ✅ Programar headers ANTES de que empiece la respuesta
+    ctx.Response.OnStarting(() =>
+    {
+        var tid = ctx.User.FindFirstValue("tid");
+        if (!string.IsNullOrWhiteSpace(tid))
+            ctx.Response.Headers["X-Tenant-Id"] = tid;
 
-    // Después de auth, si hay tid, lo reflejas
-    var tid = ctx.User.FindFirstValue("tid");
-    if (!string.IsNullOrWhiteSpace(tid))
-        ctx.Response.Headers["X-Tenant-Id"] = tid;
+        return Task.CompletedTask;
+    });
+
+    await next();
 });
 
 
@@ -1255,3 +1381,22 @@ public sealed record SearchQuery(
     DateTimeOffset? ToUtc,
     int? Limit,
     string? NextPageToken);
+
+
+
+//2) Diseño: “Start Export” → 202 + JobId
+public enum JobState { Queued, Running, Succeeded, Failed, Canceled }
+
+public sealed record JobInfo(
+    string JobId,
+    string TenantId,
+    string Kind,
+    JobState State,
+    DateTimeOffset CreatedUtc,
+    DateTimeOffset? StartedUtc,
+    DateTimeOffset? CompletedUtc,
+    string? ResultLocation,
+    string? Error);
+
+public sealed record StartExportRequest(string? Filter, int? Limit, string? NextPageToken);
+public sealed record StartJobResponse(string JobId, string StatusUrl, string? ResultUrl);
