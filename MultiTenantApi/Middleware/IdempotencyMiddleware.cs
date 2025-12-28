@@ -1,7 +1,11 @@
-﻿using MultiTenantApi.Security.IdempotencyStore;
+﻿using Microsoft.AspNetCore.DataProtection.KeyManagement;
+using MultiTenantApi.Security.IdempotencyStore;
+using System.Reflection.PortableExecutable;
 
 namespace MultiTenantApi.Middleware
 {
+    //(POST/PUT/PATCH) traigan el header Idempotency-Key y tu request lo está omitiendo.
+    //
     public sealed class IdempotencyMiddleware : IMiddleware
     {
         private readonly IIdempotencyStore _store;
