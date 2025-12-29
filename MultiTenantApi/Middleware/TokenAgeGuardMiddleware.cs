@@ -1,7 +1,8 @@
 ﻿using System.IdentityModel.Tokens.Jwt;
 using Microsoft.Extensions.Options;
+using MultiTenantApi.Security;
 
-namespace MultiTenantApi.Security;
+namespace MultiTenantApi.Middleware;
 
 public sealed class TokenAgeGuardMiddleware : IMiddleware
 {
