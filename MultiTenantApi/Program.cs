@@ -545,6 +545,10 @@ builder.Services.AddSingleton<ApiVersionTelemetryMiddleware>();
 //3.1 Middleware “RequestTelemetry” (enterprise)
 builder.Services.AddSingleton<RequestTelemetryMiddleware>();
 
+//5.2 Middleware de métricas + señales
+builder.Services.AddSingleton<SecuritySignalsMiddleware>();
+
+
 #endregion
 
 
@@ -631,6 +635,8 @@ app.UseMiddleware<ApiVersionTelemetryMiddleware>();
 //3.1 Middleware “RequestTelemetry” (enterprise)
 app.UseMiddleware<RequestTelemetryMiddleware>();
 
+//5.2 Middleware de métricas + señales
+app.UseMiddleware<SecuritySignalsMiddleware>();
 
 #endregion
 
@@ -787,10 +793,44 @@ v1.MapGet("/reports", (ClaimsPrincipal user) =>
 .RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
 .WithOpenApi();
 
+
+// ntory of exposed fields (OWASP API9)
+// =====================================================
+v1.MapGet("/export/metadata/call-records", async (
+    ICallRecordService svc,
+    IMapper mapper,
+    CancellationToken ct,
+    ClaimsPrincipal user
+    ) =>
+{
+    var fields = ApiMetadataBuilder.BuildFor<CallRecord>();
+
+    // Sample: always map to safe DTO (masking + synthetic ids)
+    var sampleDomain = await svc.GetSampleAsync(ct);
+    var sampleExport = mapper.Map<List<CallRecordExportDto>>(sampleDomain);
+
+    var response = new EntityMetadataResponse<CallRecordExportDto>(
+        EntityName: "CallRecord",
+        Version: "v1",
+        Fields: fields,
+        Sample: sampleExport);
+
+    return Results.Ok(response);
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+.Produces<EntityMetadataResponse<CallRecordExportDto>>(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status401Unauthorized)
+.ProducesProblem(StatusCodes.Status403Forbidden)
+.ProducesProblem(StatusCodes.Status429TooManyRequests)
+.WithOpenApi();
+
+
+
 // =====================================================
 // RAW data export — hardened: rate limiting + safe field projection + synthetic IDs
 // =====================================================
- v1.MapGet("/raw-records", async (
+v1.MapGet("/raw-records", async (
     HttpContext http,
     [AsParameters] RawQuery q,
     IRawDataService dataSvc,
@@ -840,39 +880,11 @@ v1.MapGet("/reports", (ClaimsPrincipal user) =>
 .ProducesProblem(StatusCodes.Status429TooManyRequests)
 .WithOpenApi();
 
-// =====================================================
-// Metadata export — inve
-//
-// ntory of exposed fields (OWASP API9)
-// =====================================================
-v1.MapGet("/export/metadata/call-records", async (
-    ICallRecordService svc,
-    IMapper mapper,
-    CancellationToken ct,
-    ClaimsPrincipal user
-    ) =>
-{
-    var fields = ApiMetadataBuilder.BuildFor<CallRecord>();
 
-    // Sample: always map to safe DTO (masking + synthetic ids)
-    var sampleDomain = await svc.GetSampleAsync(ct);
-    var sampleExport = mapper.Map<List<CallRecordExportDto>>(sampleDomain);
 
-    var response = new EntityMetadataResponse<CallRecordExportDto>(
-        EntityName: "CallRecord",
-        Version: "v1",
-        Fields: fields,
-        Sample: sampleExport);
 
-    return Results.Ok(response);
-})
-.RequireRateLimiting("exports-tenant")
-.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-.Produces<EntityMetadataResponse<CallRecordExportDto>>(StatusCodes.Status200OK)
-.ProducesProblem(StatusCodes.Status401Unauthorized)
-.ProducesProblem(StatusCodes.Status403Forbidden)
-.ProducesProblem(StatusCodes.Status429TooManyRequests)
-.WithOpenApi();
+
+
 
 
 // =====================================================
