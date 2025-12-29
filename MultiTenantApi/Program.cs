@@ -26,6 +26,8 @@ using MultiTenantApi.Services.HMAC;
 using MultiTenantApi.Services.HttpCache;
 using MultiTenantApi.Services.JobStore;
 using Serilog;
+using Serilog.Events;
+using Serilog.Filters;
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -50,7 +52,26 @@ Log.Logger = new LoggerConfiguration()
     .CreateLogger();
 
 
-builder.Host.UseSerilog();
+builder.Host.UseSerilog((ctx, lc) =>
+{
+    lc.ReadFrom.Configuration(ctx.Configuration)
+      .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+      .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
+      .Enrich.FromLogContext()
+      .Enrich.WithProperty("service", "MultiTenantApi")
+      .Enrich.WithProperty("env", ctx.HostingEnvironment.EnvironmentName)
+
+      // ✅ Nunca loguear Authorization ni cookies
+      .Filter.ByExcluding(Matching.WithProperty<string>("RequestHeader_Authorization", _ => true))
+      .Filter.ByExcluding(Matching.WithProperty<string>("RequestHeader_Cookie", _ => true))
+      .Filter.ByExcluding(Matching.WithProperty<string>("Authorization", _ => true))
+
+      // ✅ Redact “por si acaso” (si alguien lo mete por error)
+      .Destructure.ByTransforming<string>(s =>
+          s.Contains("Bearer ", StringComparison.OrdinalIgnoreCase) ? "[REDACTED]" : s)
+
+      .WriteTo.Console();
+});
 
 // Disable legacy claim type mapping so you see tid/scp/roles as-is.
 JwtSecurityTokenHandler.DefaultMapInboundClaims = false;
@@ -207,7 +228,30 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         },
         OnAuthenticationFailed = ctx =>
         {
+            // No pongas ex.Message completo: puede contener hints.
+            // Haz un mapeo conservador.
+            var reason =
+                ctx.Exception is SecurityTokenExpiredException ? "token_expired" :
+                ctx.Exception is SecurityTokenInvalidSignatureException ? "invalid_signature" :
+                ctx.Exception is SecurityTokenInvalidAudienceException ? "invalid_audience" :
+                ctx.Exception is SecurityTokenInvalidIssuerException ? "invalid_issuer" :
+                ctx.Exception is SecurityTokenException ? "token_invalid" :
+                "auth_failed";
+
+            ctx.HttpContext.Items["auth_fail_reason"] = reason;
             ctx.HttpContext.Items["auth_failed"] = true;
+
+            return Task.CompletedTask;
+        },
+        OnChallenge = ctx =>
+        {
+            // Challenge ocurre en 401; útil para saber por qué se rechazó
+            ctx.HttpContext.Items["auth_fail_reason"] ??= "challenge";
+            return Task.CompletedTask;
+        },
+        OnForbidden = ctx =>
+        {
+            ctx.HttpContext.Items["auth_fail_reason"] ??= "forbidden_policy";
             return Task.CompletedTask;
         }
     };
@@ -498,6 +542,8 @@ builder.Services.AddSingleton<DeprecationHeadersMiddleware>();
 //4) Observabilidad real: medir uso por versión + tenant + clientAppId
 builder.Services.AddSingleton<ApiVersionTelemetryMiddleware>();
 
+//3.1 Middleware “RequestTelemetry” (enterprise)
+builder.Services.AddSingleton<RequestTelemetryMiddleware>();
 
 #endregion
 
@@ -582,6 +628,9 @@ app.UseMiddleware<ApiVersioningMiddleware>();
 //4) Observabilidad real: medir uso por versión + tenant + clientAppId
 app.UseMiddleware<ApiVersionTelemetryMiddleware>();
 
+//3.1 Middleware “RequestTelemetry” (enterprise)
+app.UseMiddleware<RequestTelemetryMiddleware>();
+
 
 #endregion
 
@@ -633,17 +682,31 @@ app.UseSerilogRequestLogging(opts =>
 // =====================================================
 app.MapGet("/error", (HttpContext ctx) =>
 {
-    // No stack traces, no exception details to clients.
-    // The exception is accessible via IExceptionHandlerFeature if you need it for logging only.
+    var traceId = ctx.TraceIdentifier;
 
-    return Problem.Create(
-        ctx,
-        status: StatusCodes.Status500InternalServerError,
-        code: ApiErrorCodes.Unexpected,
+    return Results.Problem(
         title: "An unexpected error occurred.",
-        detail: "Contact support with the correlationId if the issue persists.");
-})
-.ExcludeFromDescription();
+        statusCode: StatusCodes.Status500InternalServerError,
+        extensions: new Dictionary<string, object?>
+        {
+            ["traceId"] = traceId,
+            ["errorCode"] = "internal_error"
+        });
+}).ExcludeFromDescription();
+
+//app.MapGet("/error", (HttpContext ctx) =>
+//{
+//    // No stack traces, no exception details to clients.
+//    // The exception is accessible via IExceptionHandlerFeature if you need it for logging only.
+
+//    return Problem.Create(
+//        ctx,
+//        status: StatusCodes.Status500InternalServerError,
+//        code: ApiErrorCodes.Unexpected,
+//        title: "An unexpected error occurred.",
+//        detail: "Contact support with the correlationId if the issue persists.");
+//})
+//.ExcludeFromDescription();
 //app.MapGet("/error", (HttpContext ctx) =>
 //{
 //    // RFC7807 ProblemDetails
@@ -836,7 +899,8 @@ v1.MapGet("/search", async (
         return Results.BadRequest(new
         {
             error = "invalid_query",
-            message = v.error
+            message = v.error,
+            traceId = http.TraceIdentifier
         });
     }
 
