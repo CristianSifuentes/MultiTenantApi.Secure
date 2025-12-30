@@ -1,10 +1,12 @@
-﻿namespace MultiTenantApi.Services.HMAC
+﻿using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace MultiTenantApi.Services.HMAC
 {
-    using System.Security.Cryptography;
-    using System.Text;
-    using System.Text.Json;
-    using System.Security.Cryptography;
-    using System.Text;
+
     public interface ICursorProtector
     {
         string Protect(PageCursor cursor);
@@ -74,9 +76,6 @@
         }
     }
 
-
-
-
     public static class FilterHasher
     {
             public static string Hash(string? filter)
@@ -87,4 +86,6 @@
                 return Convert.ToBase64String(bytes);
             }
     }
+
+
 }

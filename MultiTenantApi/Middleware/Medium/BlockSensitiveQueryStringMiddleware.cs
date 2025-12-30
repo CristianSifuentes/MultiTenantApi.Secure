@@ -1,4 +1,4 @@
-﻿namespace MultiTenantApi.Middleware
+﻿namespace MultiTenantApi.Middleware.Medium
 {
     public sealed class BlockSensitiveQueryStringMiddleware : IMiddleware
     {

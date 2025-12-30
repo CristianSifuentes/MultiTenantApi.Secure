@@ -1,6 +1,6 @@
 ﻿using Microsoft.Extensions.Options;
 
-namespace MultiTenantApi.Middleware
+namespace MultiTenantApi.Middleware.Medium
 {
     public sealed class DeprecationPolicyOptions
     {

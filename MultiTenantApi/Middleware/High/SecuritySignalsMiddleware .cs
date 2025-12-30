@@ -1,6 +1,6 @@
 ﻿using System.Security.Claims;
 
-namespace MultiTenantApi.Middleware
+namespace MultiTenantApi.Middleware.High
 {
     public sealed class SecuritySignalsMiddleware : IMiddleware
     {

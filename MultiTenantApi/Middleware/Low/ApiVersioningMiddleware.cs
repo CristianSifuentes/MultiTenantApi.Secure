@@ -1,4 +1,4 @@
-﻿namespace MultiTenantApi.Middleware
+﻿namespace MultiTenantApi.Middleware.Low
 {
     public sealed class ApiVersioningMiddleware : IMiddleware
     {

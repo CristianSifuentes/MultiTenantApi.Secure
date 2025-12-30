@@ -15,13 +15,16 @@ using Microsoft.Win32;
 using MultiTenantApi.Common;
 using MultiTenantApi.Infrastructure; // JsonWebToken (faster parser)
 using MultiTenantApi.Mapping;
-using MultiTenantApi.Middleware;
+using MultiTenantApi.Middleware.High;
+using MultiTenantApi.Middleware.Low;
+using MultiTenantApi.Middleware.Medium;
 using MultiTenantApi.Models;
 using MultiTenantApi.Security;
 using MultiTenantApi.Security.IdempotencyStore;
 using MultiTenantApi.Security.ProblemDetails;
 using MultiTenantApi.Services;
 using MultiTenantApi.Services.CacheService;
+using MultiTenantApi.Services.Filter;
 using MultiTenantApi.Services.HMAC;
 using MultiTenantApi.Services.HttpCache;
 using MultiTenantApi.Services.JobStore;
@@ -100,7 +103,7 @@ builder.Services.Configure<RateLimitingEnterpriseOptions>(
     builder.Configuration.GetSection("RateLimitingEnterprise"));
 
 // Esto NO reemplaza WAF, pero hace tu app resistente incluso si el WAF falla o está mal configurado. 
-builder.Services.Configure<RequestLimitsOptions>(builder.Configuration.GetSection("RequestLimits"));
+//builder.Services.Configure<RequestLimitsOptions>(builder.Configuration.GetSection("RequestLimits"));
 
 //3.2 Middleware global de deprecación por versión
 builder.Services.Configure<DeprecationPolicyOptions>(builder.Configuration.GetSection("DeprecationPolicy"));
@@ -561,20 +564,15 @@ var app = builder.Build();
 
 // Aqui podemos manejar el versionado de apis
 var api = app.MapGroup("/api");
-
-
 var v1 = api.MapGroup("/v1")
     .WithTags("v1")
     .WithOpenApi();
-
 var v2 = api.MapGroup("/v2")
     .WithTags("v2")
     .WithOpenApi();
-
 var v3 = api.MapGroup("/v3")
     .WithTags("v3")
     .WithOpenApi();
-
 var v4 = api.MapGroup("/v4")
     .WithTags("v4")
     .WithOpenApi();
@@ -700,6 +698,10 @@ app.MapGet("/error", (HttpContext ctx) =>
         });
 }).ExcludeFromDescription();
 
+
+
+
+
 //app.MapGet("/error", (HttpContext ctx) =>
 //{
 //    // No stack traces, no exception details to clients.
@@ -722,6 +724,118 @@ app.MapGet("/error", (HttpContext ctx) =>
 //        statusCode: StatusCodes.Status500InternalServerError,
 //        extensions: new Dictionary<string, object?> { ["traceId"] = traceId });
 //}).ExcludeFromDescription();
+
+
+
+
+// =====================================================
+// RAW data export — hardened: rate limiting + safe field projection + synthetic IDs
+// =====================================================
+v1.MapGet("/reports/call-records", async (
+    HttpContext http,
+    [AsParameters] RawQuery q,
+    IRawDataService dataSvc,
+    ISyntheticIdService synth,
+    ClaimsPrincipal user) =>
+{
+    //✅ ABAC: tenant scoping(deny-by - default)
+    var tenant = TenantContextFactory.From(user);
+    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+        return Results.Forbid();
+
+    // clamp limit to prevent resource abuse
+    // Quien implemente take usa limit cursor
+    // necesito volver a ver como fundiona el limit cursor
+    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+
+
+    // after
+    var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, http.RequestAborted);
+
+
+    var items = page.Items.Select(r =>
+    {
+        // Project safe fields only + apply masking if configured on attributes
+        var shape = FieldProjector.ToApiShape(r, synth);
+
+        // Provide a synthetic stable id for external correlation, without revealing internal IDs.
+        //shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
+        return shape;
+    });
+
+    return Results.Ok(new
+    {
+        items,
+        page = new
+        {
+            limit = take,
+            nextPageToken = page.NextToken,
+            count = page.Items.Count
+        }
+    });
+})
+.RequireRateLimiting("exports-tenant")
+.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
+.Produces(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status401Unauthorized)
+.ProducesProblem(StatusCodes.Status403Forbidden)
+.ProducesProblem(StatusCodes.Status429TooManyRequests)
+.WithOpenApi();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -826,64 +940,102 @@ v1.MapGet("/export/metadata/call-records", async (
 .WithOpenApi();
 
 
+//v1.MapGet("/call-records", async (
+//    HttpContext http,
+//    ICallRecordService svc,
+//    IMapper mapper,
+//    ISyntheticIdService synth,
+//    ICursorProtector cursorProtector,
+//    ClaimsPrincipal user,
+//    CancellationToken ct) =>
+//{
+//    var tenant = TenantContextFactory.From(user);
+//    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+//        return Results.Forbid();
 
-// =====================================================
-// RAW data export — hardened: rate limiting + safe field projection + synthetic IDs
-// =====================================================
-v1.MapGet("/raw-records", async (
-    HttpContext http,
-    [AsParameters] RawQuery q,
-    IRawDataService dataSvc,
-    ISyntheticIdService synth,
-    ClaimsPrincipal user) =>
-{
-    var tenant = TenantContextFactory.From(user);
+//    // 1) limit clamp (Chargebee style)
+//    var limitRaw = http.Request.Query["limit"].ToString();
+//    var limit = int.TryParse(limitRaw, out var l) ? l : 25;
+//    limit = Math.Clamp(limit, 1, 100);
 
-    // clamp limit to prevent resource abuse
-    // Quien implemente take usa limit cursor
-    // necesito volver a ver como fundiona el limit cursor
-    var take = Math.Clamp(q.Limit ?? 100, 1, 100);
+//    // 2) parse filters + sort (Chargebee style)
+//    var parsed = FilterValidator.ParseChargebeeStyle(http);
+//    if (!parsed.ok)
+//        return Results.BadRequest(new { error = "invalid_query", message = parsed.error, traceId = http.TraceIdentifier });
 
-    //before
-    //var page = await dataSvc.QueryAsync(q.Filter, q.NextPageToken, take, http.RequestAborted);
+//    var filters = parsed.filters;
+//    var sort = parsed.sort!; // e.g. "endTime:desc"
 
-    // after
-    var page = await dataSvc.QueryAsync(tenant.TenantId, q.Filter, q.NextPageToken, take, http.RequestAborted);
+//    // 3) unprotect cursor (offset)
+//    CallRecordsCursor? cursor = null;
+//    var offset = http.Request.Query["offset"].ToString();
+//    if (!string.IsNullOrWhiteSpace(offset))
+//    {
+//        if (!cursorProtector.TryUnprotect(offset, out CallRecordsCursor? c) || c is null)
+//            return Results.BadRequest(new { error = "invalid_offset" });
 
+//        // bind to tenant + filter + sort
+//        if (!string.Equals(c.TenantId, tenant.TenantId, StringComparison.Ordinal))
+//            return Results.BadRequest(new { error = "offset_tenant_mismatch" });
 
-    var items = page.Items.Select(r =>
-    {
-        // Project safe fields only + apply masking if configured on attributes
-        var shape = FieldProjector.ToApiShape(r, synth);
+//        var expectedHash = FilterHasher.Hash(FilterValidator.StableFilterString(filters, sort));
+//        if (!string.Equals(c.FilterHash, expectedHash, StringComparison.Ordinal))
+//            return Results.BadRequest(new { error = "offset_filter_mismatch" });
 
-        // Provide a synthetic stable id for external correlation, without revealing internal IDs.
-        shape["syntheticId"] = synth.Create("raw", r.InternalId.ToString("N"));
-        return shape;
-    });
+//        // optional TTL
+//        if (c.IssuedUtc < DateTimeOffset.UtcNow.AddMinutes(-30))
+//            return Results.BadRequest(new { error = "offset_expired" });
 
-    return Results.Ok(new
-    {
-        items,
-        page = new
-        {
-            limit = take,
-            nextPageToken = page.NextToken,
-            count = page.Items.Count
-        }
-    });
-})
-.RequireRateLimiting("exports-tenant")
-.RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName)
-.Produces(StatusCodes.Status200OK)
-.ProducesProblem(StatusCodes.Status401Unauthorized)
-.ProducesProblem(StatusCodes.Status403Forbidden)
-.ProducesProblem(StatusCodes.Status429TooManyRequests)
-.WithOpenApi();
+//        cursor = c;
+//    }
 
+//    // 4) fetch
+//    var all = await svc.GetSampleAsync(ct); // hoy in-memory
 
+//    // 5) apply filters + sorting in-memory (hoy); mañana empujas a DB con Expression Builder
+//    var filtered = FilterValidator.ApplyFilters(all, filters);
+//    var ordered = FilterValidator.ApplySort(filtered, sort);
 
+//    // 6) cursor paging by "LastKey" (endTime+syntheticCallId, etc.)
+//    // LastKey: aquí usaremos endTime ticks + callId (o interactionId) si existe.
+//    var page = FilterValidator.PageByCursor(ordered, cursor?.LastKey, limit);
 
+//    // 7) map + synthetic
+//    var dto = mapper.Map<List<CallRecordExportDto>>(page.Items);
+//    for (var i = 0; i < dto.Count; i++)
+//    {
+//        var src = page.Items[i];
+//        dto[i] = dto[i] with
+//        {
+//            SyntheticCallId = synth.Create("call", src.CallId, src.InteractionId.ToString())
+//        };
+//    }
 
+//    // 8) create next_offset
+//    string? nextOffset = null;
+//    if (page.NextLastKey is not null)
+//    {
+//        var hash = FilterHasher.Hash(FilterValidator.StableFilterString(filters, sort));
+//        var nextCursor = new CallRecordsCursor(
+//            TenantId: tenant.TenantId,
+//            FilterHash: hash,
+//            Sort: sort,
+//            LastKey: page.NextLastKey,
+//            IssuedUtc: DateTimeOffset.UtcNow);
+
+//        nextOffset = cursorProtector.Protect(nextCursor);
+//    }
+
+//    return Results.Ok(new
+//    {
+//        items = dto,
+//        count = dto.Count,
+//        next_offset = nextOffset
+//    });
+//})
+//.RequireRateLimiting("exports-tenant")
+//.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+//.WithOpenApi();
 
 
 
@@ -981,30 +1133,30 @@ v1.MapGet("/search", async (
 
 
 
-v1.MapGet("/call-records", async (
-    ICallRecordService svc,
-    IMapper mapper,
-    ISyntheticIdService synth,
-    CancellationToken ct,
-    ClaimsPrincipal user) =>
-{
-    var records = await svc.GetSampleAsync(ct);
-    var dto = mapper.Map<List<CallRecordExportDto>>(records);
-    for (var i = 0; i < dto.Count; i++)
-    {
-        var src = records[i];
-        dto[i] = dto[i] with { SyntheticCallId = synth.Create("call", src.CallId, src.InteractionId.ToString()) };
-    }
+//v1.MapGet("/call-records", async (
+//    ICallRecordService svc,
+//    IMapper mapper,
+//    ISyntheticIdService synth,
+//    CancellationToken ct,
+//    ClaimsPrincipal user) =>
+//{
+//    var records = await svc.GetSampleAsync(ct);
+//    var dto = mapper.Map<List<CallRecordExportDto>>(records);
+//    for (var i = 0; i < dto.Count; i++)
+//    {
+//        var src = records[i];
+//        dto[i] = dto[i] with { SyntheticCallId = synth.Create("call", src.CallId, src.InteractionId.ToString()) };
+//    }
 
-    return Results.Ok(new
-    {
-        items = dto,
-        count = dto.Count
-    });
-})
-.RequireRateLimiting("exports-tenant")
-.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
-.WithOpenApi();
+//    return Results.Ok(new
+//    {
+//        items = dto,
+//        count = dto.Count
+//    });
+//})
+//.RequireRateLimiting("exports-tenant")
+//.RequireAuthorization(AuthzPolicies.ReportsReadPolicyName)
+//.WithOpenApi();
 
 
 v1.MapGet("/raw-records/ABAC", async (
@@ -1582,6 +1734,32 @@ app.Use(async (ctx, next) =>
 
 
 app.Run();
+
+
+//filtering v2
+public sealed record CallRecordsListQuery(
+    int? Limit,
+    string? Offset,   // signed cursor token
+    string? SortAsc,
+    string? SortDesc
+);
+
+
+public sealed record FieldFilter(
+    string Field,
+    FilterOp Op,
+    string[] Values
+);
+
+
+public sealed record CallRecordsCursor(
+    string TenantId,
+    string FilterHash,
+    string Sort,        // e.g. "endTime:desc"
+    string LastKey,     // e.g. last endTime ticks + id
+    DateTimeOffset IssuedUtc
+);
+
 
 public sealed record PageCursor(
     string TenantId,

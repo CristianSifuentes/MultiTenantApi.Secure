@@ -1,6 +1,6 @@
 using Serilog.Context;
 
-namespace MultiTenantApi.Middleware;
+namespace MultiTenantApi.Middleware.High;
 
 
 //public sealed class CorrelationIdMiddleware : IMiddleware

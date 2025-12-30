@@ -1,4 +1,4 @@
-﻿namespace MultiTenantApi.Middleware
+﻿namespace MultiTenantApi.Middleware.Medium
 {
     using System.Diagnostics;
     using Serilog.Context;

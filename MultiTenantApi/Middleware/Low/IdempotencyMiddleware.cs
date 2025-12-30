@@ -2,7 +2,7 @@
 using MultiTenantApi.Security.IdempotencyStore;
 using System.Reflection.PortableExecutable;
 
-namespace MultiTenantApi.Middleware
+namespace MultiTenantApi.Middleware.Low
 {
     //(POST/PUT/PATCH) traigan el header Idempotency-Key y tu request lo está omitiendo.
     //
