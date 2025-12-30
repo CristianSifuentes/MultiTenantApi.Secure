@@ -1,6 +1,6 @@
 ﻿using MultiTenantApi.Security.ProblemDetails;
 
-namespace MultiTenantApi.Middleware
+namespace MultiTenantApi.Middleware.Medium
 {
     public sealed class AuthProblemDetailsMiddleware : IMiddleware
     {

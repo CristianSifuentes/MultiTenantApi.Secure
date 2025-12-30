@@ -2,7 +2,7 @@
 using Microsoft.Extensions.Options;
 using System.Reflection.PortableExecutable;
 
-namespace MultiTenantApi.Middleware;
+namespace MultiTenantApi.Middleware.High;
 
 
 

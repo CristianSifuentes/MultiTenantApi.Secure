@@ -2,7 +2,8 @@
 using Microsoft.Extensions.Options;
 using MultiTenantApi.Security;
 
-namespace MultiTenantApi.Middleware;
+namespace MultiTenantApi.Middleware.High;
+
 
 public sealed class TokenAgeGuardMiddleware : IMiddleware
 {

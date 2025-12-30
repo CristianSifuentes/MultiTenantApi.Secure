@@ -2,7 +2,7 @@
 using Microsoft.Extensions.Logging;
 using System.Text.RegularExpressions;
 
-namespace MultiTenantApi.Middleware;
+namespace MultiTenantApi.Middleware.Medium;
 
 public sealed class WafSignalsMiddleware : IMiddleware
 {

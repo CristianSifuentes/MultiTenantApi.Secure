@@ -1,4 +1,4 @@
-namespace MultiTenantApi.Middleware;
+namespace MultiTenantApi.Middleware.High;
 
 /// <summary>
 /// Enforces HTTPS. Also respects X-Forwarded-Proto when running behind a proxy/gateway.
