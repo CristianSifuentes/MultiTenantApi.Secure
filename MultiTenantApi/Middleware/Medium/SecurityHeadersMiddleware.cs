@@ -1,4 +1,4 @@
-namespace MultiTenantApi.Middleware;
+namespace MultiTenantApi.Middleware.Medium;
 
 /// <summary>
 /// Security headers are defense-in-depth. Many should also be set at the gateway/CDN.

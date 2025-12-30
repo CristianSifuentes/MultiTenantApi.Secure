@@ -1,4 +1,4 @@
-﻿namespace MultiTenantApi.Security
+﻿namespace MultiTenantApi.Middleware.High
 {
     public sealed class BlockApiKeyOnSensitiveRoutesMiddleware : IMiddleware
     {
