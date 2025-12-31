@@ -46,6 +46,10 @@ using MultiTenantApi.Services.HMAC;
 using MultiTenantApi.Services.HttpCache;
 using MultiTenantApi.Services.JobStore;
 
+
+using Microsoft.AspNetCore.OData;
+using Microsoft.OData.ModelBuilder;
+
 #endregion
 
 #region Bootstrap
@@ -128,6 +132,35 @@ builder.Services.Configure<DeprecationPolicyOptions>(builder.Configuration.GetSe
 builder.Services.AddDistributedMemoryCache();
 
 #endregion
+
+#region OData (Enterprise Query Surface)
+
+
+
+builder.Services
+    .AddControllers()
+    .AddOData(opt =>
+    {
+        // EDM model: what the service exposes
+        var edmBuilder = new ODataConventionModelBuilder();
+
+        // EntitySet name MUST match controller name convention (CustomersController => Customers)
+        edmBuilder.EntitySet<CallRecordODataDto>("CallRecords");
+
+        // Route: /api/v1/odata/...
+        opt.AddRouteComponents("api/v1/odata", edmBuilder.GetEdmModel())
+           .Select()
+           .Filter()
+           .OrderBy()
+           .Expand()
+           .Count()
+           .SetMaxTop(200); // hard limit (defense-in-depth)
+    });
+
+
+
+#endregion
+
 
 #region Authentication (JWT Bearer) — Hardened Validation
 
@@ -604,6 +637,7 @@ app.UseMiddleware<SecuritySignalsMiddleware>();
 
 #endregion
 
+
 #region Swagger UI
 
 app.UseSwagger();
@@ -631,6 +665,11 @@ app.UseAuthorization();
 
 // Normalizes auth failures into consistent ProblemDetails responses.
 app.UseMiddleware<AuthProblemDetailsMiddleware>();
+
+#region OData
+// OData uses controllers; make sure controller endpoints are mapped.
+app.MapControllers();
+#endregion
 
 #endregion
 
@@ -664,6 +703,19 @@ app.UseSerilogRequestLogging(opts =>
         LogEventLevel.Information;
 });
 
+#endregion
+
+
+#region Debug
+app.MapGet("/__debug/endpoints", (IEnumerable<EndpointDataSource> sources) =>
+{
+    var endpoints = sources.SelectMany(s => s.Endpoints)
+        .Select(e => e.DisplayName)
+        .OrderBy(x => x)
+        .ToList();
+
+    return Results.Ok(endpoints);
+}).AllowAnonymous();
 #endregion
 
 #region Error Endpoint (/error) — RFC7807

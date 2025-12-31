@@ -202,7 +202,7 @@ public interface IRawDataService
 
 public sealed class InMemoryRawDataService : IRawDataService
 {
-    private readonly List<RawRecord> _data;
+    public readonly List<RawRecord> _data;
 
     public InMemoryRawDataService()
     {
